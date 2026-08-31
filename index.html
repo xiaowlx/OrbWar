@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OrbWar — 球球领土战争</title>
+<style>
+  :root { --bg:#07080d; --panel:#10121c; --line:#23263a; --txt:#c9d1e8; --dim:#5b6277; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { background:var(--bg); color:var(--txt); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; height:100%; }
+  body { display:flex; flex-direction:column; align-items:center; padding:14px; gap:12px; }
+  #stage { width:100%; max-width:1366px; }
+  canvas { display:block; width:100%; height:auto; border-radius:12px; background:#05060a; box-shadow:0 0 0 1px var(--line), 0 20px 60px rgba(0,0,0,.5); }
+  #bar { width:100%; max-width:1366px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .btn { background:var(--panel); border:1px solid var(--line); color:var(--txt); padding:8px 16px; border-radius:8px; cursor:pointer; font-size:14px; user-select:none; }
+  .btn:hover { border-color:#3a4060; background:#171a2a; }
+  .hint { color:var(--dim); font-size:12px; margin-left:auto; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="cv" width="1366" height="760"></canvas></div>
+  <div id="bar">
+    <button class="btn" id="btnPause">暂停</button>
+    <button class="btn" id="btnSpeed">速度 1x</button>
+    <button class="btn" id="btnRestart">重开</button>
+    <span class="hint">左：资源球穿缝隙翻倍 · 落武器槽蓄能　右：炮台旋转开火（子弹铺路=数值 · 反弹 · 互撞偏移 · 盾吸收）</span>
+  </div>
+<script>
+"use strict";
+
+/* ============================================================
+ *  OrbWar — 球球领土战争
+ *  占领面积严格等于武器数值：子弹每染一格(敌/空)扣 1 点数值，
+ *  数值耗尽即止。无自动扩张。
+ *  左：上层 X8 X4 X2 — — X2 X4 X8（穿缝隙翻倍）下移；下层 武器槽
+ *  右：四势力旋转炮台，按落槽武器开火；盾为可吸收数值的环
+ * ============================================================ */
+
+const cv  = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+// ---------- 布局 ----------
+const HUD_H  = 56;
+const SPLIT  = 384;
+const BX = SPLIT + 10, BY = HUD_H + 10;
+const rightW = W - SPLIT - 20;
+const rightH = H - HUD_H - 20;
+
+// ---------- 百万像素战场网格 ----------
+const TARGET = 2_000_000;            // 精度：1M→2M；若机器强可继续上调（4M+ 建议套壳成应用）
+const ar = rightW / rightH;
+const GW = Math.round(Math.sqrt(TARGET * ar));
+const GH = Math.round(TARGET / GW);
+const BS = Math.min(rightW / GW, rightH / GH);
+const drawW = GW * BS, drawH = GH * BS;
+
+// ---------- 左板两层 ----------
+const MULT = [8,4,2,1,1,2,4,8];
+const MULT_N = MULT.length;
+const WEAPONS = [
+  { key:"sniper", name:"狙击" },
+  { key:"mg",     name:"机枪" },
+  { key:"big",    name:"大球" },
+  { key:"shield", name:"盾"   },
+  { key:"storm",  name:"风暴" },
+];
+const WEAPON_COLORS = [[255,155,176],[255,210,122],[122,208,255],[142,255,200],[199,155,255]];
+
+// ---------- 常量 ----------
+const HP_MAX   = 3200;
+const VALUE0   = 1000;
+const R0       = 22;
+const WALL     = 3;
+const WALL_DAMP= 0.9;
+const MAXB     = 60;
+const BASEHIT_R= R0 + 4;
+const SPEED    = 240;
+const SPEED_SN = 470;
+const SPEED_BG = 150;
+const SPEED_ST  = 280;
+const FIRE_CD  = 0.5;
+const DAMAGE_K = 0.05;
+const COST_CELL= 1.0;               // 每染一格(敌/空)消耗的数值
+const MG_UNIT  = 200;               // 机枪每颗子弹对应的数值
+const MG_GAP   = 0.045, STORM_GAP = 0.03;
+const SHIELD_CAP   = 6000;
+const SHIELD_DECAY = 8;             // 盾每秒自然衰减
+const SHIELD_BR    = R0 + 26;       // 盾环基础半径
+const SHIELD_R_PER = 0.00005;       // 盾环随数值增大的半径
+const BIG_MOMENTUM = 1.9;           // 大球碰撞动量系数
+// 占领横截面：随子弹当前数值(大小)变化；密度系数 + 分武器上限让狙击比大球细很多
+const DENS = { sniper:0.45, mg:0.55, big:1.0, storm:0.55, idle:1 };
+const TRAIL_CAP = { sniper:9, mg:5, big:26, storm:6, idle:1 };
+const BASE_INSET  = 64;             // 势力母球距角落的内缩量（不再贴角）
+const IDLE_RATE   = 1000;           // 怠速细弹发射频率（颗/秒）：左侧无武器时维持推进
+const IDLE_VAL    = 5;              // 每颗怠速弹可占领的格数（1px 细线）
+function trailRadius(value, weapon){
+  const cap = TRAIL_CAP[weapon] || 7;
+  return Math.max(1, Math.min(cap, 0.07*Math.sqrt(value)*DENS[weapon]));
+}
+const BULLET_CAP   = 2000;
+
+const FACTION_DEFS = [
+  { name:"红", base:[255, 72, 72]  },
+  { name:"绿", base:[ 78, 220, 92] },
+  { name:"蓝", base:[ 76, 126, 255]},
+  { name:"黄", base:[255, 200, 60] },
+];
+const ROT = [0.9, -1.1, 1.0, -0.8];
+
+// ---------- 工具 ----------
+function baseGX(fid){ return (fid===1||fid===3) ? BASE_INSET : GW-BASE_INSET; }
+function baseGY(fid){ return (fid===1||fid===2) ? BASE_INSET : GH-BASE_INSET; }
+function rgb(c){ return "rgb("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+")"; }
+function rgba(c,a){ return "rgba("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+","+a+")"; }
+function packColor(c, br){ const r=(c[0]*br)|0,g=(c[1]*br)|0,b=(c[2]*br)|0; return ((255<<24)|(b<<16)|(g<<8)|r)>>>0; }
+function fmtVal(v){ return v>=1000 ? (v/1000).toFixed(v>=10000?0:1)+"k" : ""+Math.round(v); }
+function visualR(value, isBig){ return Math.max(2, Math.min(isBig?30:18, (isBig?3:2) + Math.sqrt(value)*(isBig?0.22:0.12))); }
+
+// ---------- 离屏百万像素缓冲 ----------
+let backCanvas, backCtx, backImg, backBuf;
+const DARK = packColor([10,12,20], 1);
+function ensureBack(){
+  if(!backCanvas){
+    backCanvas = document.createElement("canvas");
+    backCanvas.width = GW; backCanvas.height = GH;
+    backCtx = backCanvas.getContext("2d");
+    backImg = backCtx.createImageData(GW, GH);
+    backBuf = new Uint32Array(backImg.data.buffer);
+  }
+}
+
+let S = null;
+
+// ---------- 像素写入（平滑、均匀、无噪点） ----------
+function setPixel(idx, fac){
+  const gx=idx%GW, gy=(idx/GW)|0;
+  const dx=gx-baseGX(fac.id), dy=gy-baseGY(fac.id);
+  const norm=Math.min(1, Math.sqrt(dx*dx+dy*dy)/(GW*0.6));
+  const br=0.92 - 0.30*norm;                 // 距母球越近越亮，整体均匀渐变
+  backBuf[idx]=packColor(fac.base, br);
+}
+function claimCell(idx, fac){
+  const prev=S.cell[idx];
+  if(prev===fac.id) return;
+  if(prev!==0) S.factions[prev-1].area--;
+  S.cell[idx]=fac.id; S.factions[fac.id-1].area++;
+  setPixel(idx, fac);
+}
+function paintCell(idx, fac){
+  const prev=S.cell[idx];
+  if(prev===fac.id) return false;
+  if(prev!==0) S.factions[prev-1].area--;
+  S.cell[idx]=fac.id; S.factions[fac.id-1].area++;
+  setPixel(idx, fac);
+  return true;
+}
+
+// ---------- reset ----------
+function reset(){
+  ensureBack();
+  for(let i=0;i<GW*GH;i++) backBuf[i]=DARK;
+
+  const factions = FACTION_DEFS.map((d,i)=>({
+    id:i+1, name:d.name, base:d.base.slice(),
+    hp:HP_MAX, area:0, alive:true, shield:0,
+    angle:i*Math.PI/2, rot:ROT[i],
+    fireCD:FIRE_CD*(0.5+Math.random()*0.5),
+    salvo:null, ammo:[], lastWeapon:"—", idleT:0,
+  }));
+
+  const cell = new Uint16Array(GW*GH);
+  S = { factions, cell, backBuf, balls:[], pegs:[], bullets:[], parts:[], texts:[],
+        time:0, speed:1, paused:false,
+        log:{ text:"战斗开始", t:2.2 }, stats:{ fired:0 } };
+
+  // 四角母球 + 初始领地（自由起始，不计入武器数值）
+  for(let f=0; f<4; f++){
+    const cx=baseGX(f+1), cy=baseGY(f+1), RR=R0-2;
+    for(let dy=-RR;dy<=RR;dy++) for(let dx=-RR;dx<=RR;dx++){
+      if(dx*dx+dy*dy<=RR*RR){
+        const gx=cx+dx, gy=cy+dy;
+        if(gx>=0&&gx<GW&&gy>=0&&gy<GH) claimCell(gy*GW+gx, factions[f]);
+      }
+    }
+  }
+
+  // 左板两层几何
+  const panelL=16, panelR=SPLIT-16, panelW=panelR-panelL;
+  S.layerX0=panelL; S.colW=panelW/MULT_N; S.panelL=panelL; S.panelR=panelR;
+  S.multY=HUD_H+249;                       // 倍数层再下移两格(2×42px)
+  S.slotW=panelW/WEAPONS.length;
+  S.weaponY=H-130;
+
+  // 其余阻拦杆（随机掉落）；左右最外侧各一根贴边杆，防止小球卡在杆与边缘之间
+  const pegs=[]; let ri=0;
+  for(let y=HUD_H+70; y<S.weaponY-24; y+=42){
+    pegs.push({x:panelL, y, r:4});          // 最左贴边杆
+    pegs.push({x:panelR, y, r:4});          // 最右贴边杆
+    const off=(ri++%2)?20:0;
+    for(let x=panelL+off; x<panelR; x+=40) if(x>panelL+6 && x<panelR-6) pegs.push({x,y,r:4});
+  }
+  S.pegs=pegs;
+
+  for(let f=0;f<4;f++) S.balls.push(makeBall(f+1));
+
+  for(let i=0;i<2000;i++) S.parts.push({active:false,x:0,y:0,vx:0,vy:0,life:0,max:1,r:2,c:[255,255,255]});
+  S.bulletSprite=factions.map(f=>makeGlow(f.base,10));
+  S.baseSprite  =factions.map(f=>makeGlow(f.base,40));
+}
+
+function makeBall(fid){
+  return { fid, x:60+Math.random()*(SPLIT-120), y:HUD_H+34,
+           vx:(Math.random()-0.5)*40, vy:0, r:9, value:VALUE0, multDone:false, bestY:HUD_H+34, refY:HUD_H+34, stuck:0, dir:(Math.random()<0.5?-1:1) };
+}
+function resetBall(b){
+  b.x=40+Math.random()*(SPLIT-80); b.y=HUD_H+34;
+  b.vx=(Math.random()-0.5)*40; b.vy=0; b.value=VALUE0; b.multDone=false; b.bestY=b.y; b.refY=b.y; b.stuck=0;
+}
+// 吃到倍数：保留当前数值，返回顶部重落（链式翻倍）
+function redropKeepValue(b){
+  b.x=40+Math.random()*(SPLIT-80); b.y=HUD_H+34;
+  b.vx=(Math.random()-0.5)*40; b.vy=0; b.multDone=false; b.bestY=b.y; b.refY=b.y; b.stuck=0;
+}
+
+function makeGlow(color,R){
+  const c=document.createElement("canvas"); c.width=c.height=R*2;
+  const g=c.getContext("2d");
+  const grd=g.createRadialGradient(R,R,0,R,R,R);
+  grd.addColorStop(0,rgba(color,1)); grd.addColorStop(0.4,rgba(color,0.5)); grd.addColorStop(1,rgba(color,0));
+  g.fillStyle=grd; g.beginPath(); g.arc(R,R,R,0,Math.PI*2); g.fill();
+  return c;
+}
+
+// ---------- 粒子 / 飘字 ----------
+function spawnParticle(x,y,vx,vy,life,r,color){
+  for(let i=0;i<S.parts.length;i++){ const p=S.parts[i];
+    if(!p.active){ p.active=true;p.x=x;p.y=y;p.vx=vx;p.vy=vy;p.life=life;p.max=life;p.r=r;p.c=color; return; } }
+}
+function spawnBurst(x,y,n,color,speed){
+  for(let i=0;i<n;i++){ const a=Math.random()*Math.PI*2, s=speed*(0.3+Math.random()*0.7);
+    spawnParticle(x,y,Math.cos(a)*s,Math.sin(a)*s,0.4+Math.random()*0.6,1.5+Math.random()*2,color); }
+}
+function addText(x,y,str,color){
+  if(S.texts.length>80) S.texts.shift();
+  S.texts.push({x,y,str,color,life:1.2,max:1.2});
+}
+
+// ---------- 子弹 ----------
+function spawnProj(o){
+  if(S.bullets.length>=BULLET_CAP) S.bullets.shift();
+  S.bullets.push({
+    fid:o.fid, weapon:o.weapon, isBig:!!o.isBig,
+    x:o.x, y:o.y, px:o.x, py:o.y, vx:o.vx, vy:o.vy,
+    value:o.value, r:visualR(o.value,o.isBig), trailR:o.trailR,
+    life:o.life, bounces:0, dead:false,
+  });
+}
+function muzzlePos(fid,ang){
+  const gx=baseGX(fid), gy=baseGY(fid);
+  return { gx:gx+Math.cos(ang)*(R0+5), gy:gy+Math.sin(ang)*(R0+5) };
+}
+function spawnForWeapon(wid, fid, value, ang){
+  const f=S.factions[fid-1];
+  const m=muzzlePos(fid,ang), cos=Math.cos(ang), sin=Math.sin(ang);
+  const tr=trailRadius(value, wid);          // 横截面由数值+武器密度决定
+  if(wid==="sniper")
+    spawnProj({fid,weapon:"sniper",x:m.gx,y:m.gy,vx:cos*SPEED_SN,vy:sin*SPEED_SN,value,trailR:tr,life:18});
+  else if(wid==="mg")
+    spawnProj({fid,weapon:"mg",x:m.gx,y:m.gy,vx:cos*SPEED,vy:sin*SPEED,value,trailR:tr,life:12});
+  else if(wid==="big")
+    spawnProj({fid,weapon:"big",x:m.gx,y:m.gy,vx:cos*SPEED_BG,vy:sin*SPEED_BG,value,trailR:tr,life:32,isBig:true});
+  else if(wid==="storm")
+    spawnProj({fid,weapon:"storm",x:m.gx,y:m.gy,vx:cos*SPEED_ST,vy:sin*SPEED_ST,value,trailR:tr,life:11});
+  spawnBurst(BX+m.gx*BS, BY+m.gy*BS, 6, f.base, 4);
+}
+
+// ---------- 怠速细弹（左侧无武器时维持推进） ----------
+function fireIdle(f){
+  const ang=f.angle, m=muzzlePos(f.id,ang), cos=Math.cos(ang), sin=Math.sin(ang);
+  spawnProj({fid:f.id, weapon:"idle", x:m.gx, y:m.gy,
+             vx:cos*SPEED*0.8, vy:sin*SPEED*0.8, value:IDLE_VAL, trailR:1, life:0.18});
+  S.stats.fired++;
+}
+
+// ---------- 左板：穿缝隙翻倍 + 落武器槽 ----------
+function stepPlinko(dt){
+  const sub=2, sdt=dt/sub;
+  for(let ss=0;ss<sub;ss++){
+    for(const b of S.balls){
+      b.vy+=900*sdt; b.x+=b.vx*sdt; b.y+=b.vy*sdt;
+      b.vx+=(Math.random()-0.5)*4;            // 微扰：避免小球卡在栏杆顶点上下弹跳
+      if(b.x<S.panelL+b.r){ b.x=S.panelL+b.r; b.vx=Math.abs(b.vx)*0.7; }
+      if(b.x>S.panelR-b.r){ b.x=S.panelR-b.r; b.vx=-Math.abs(b.vx)*0.7; }
+      for(const peg of S.pegs){
+        const dx=b.x-peg.x, dy=b.y-peg.y, d2=dx*dx+dy*dy, min=b.r+peg.r;
+        if(d2<min*min){
+          const d=Math.sqrt(d2)||0.001, nx=dx/d, ny=dy/d, overlap=min-d;
+          b.x+=nx*overlap; b.y+=ny*overlap;            // 最小穿透修正：保留横向位移，不再吸附到栏杆中心
+          const vn=b.vx*nx+b.vy*ny;
+          if(vn<0){ b.vx-=1.6*vn*nx; b.vy-=1.6*vn*ny; }
+          b.vx*=0.85; b.vy*=0.85;
+          if(Math.abs(nx)<0.4 && Math.abs(b.vx)<50) b.vx = (b.vx>=0?1:-1)*60;   // 顶点附近保证持续横向速度，滑离栏杆防原地弹跳
+        }
+      }
+      // 防卡死保险：每 ~0.5s 检查一次，若期间几乎无下落进展则朝固定方向强力冲击，破除任何栏杆口袋
+      if(b.y>b.bestY) b.bestY=b.y;
+      if(++b.stuck>=60){ if(b.bestY < b.refY+4){ b.vx=b.dir*220; b.vy=Math.max(b.vy,140); b.dir=-b.dir; } b.refY=b.bestY; b.stuck=0; }
+      if(!b.multDone && b.y>=S.multY){
+        const col=Math.max(0,Math.min(MULT_N-1,Math.floor((b.x-S.layerX0)/S.colW)));
+        const m=MULT[col];
+        if(m>1){
+          b.value*=m;
+          if(b.value>5_000_000) b.value=5_000_000;   // 防极端连乘
+          addText(b.x,S.multY-14,"X"+m,[255,215,110]); spawnBurst(b.x,S.multY,8,[255,215,110],4);
+          redropKeepValue(b);                          // 链式：回顶重落
+        } else {
+          b.multDone=true;                             // 空列：本趟不再触发
+        }
+      } else if(b.y>=S.weaponY){
+        const col=Math.max(0,Math.min(WEAPONS.length-1,Math.floor((b.x-S.layerX0)/S.slotW)));
+        S.factions[b.fid-1].ammo.push({ weapon:WEAPONS[col].key, value:b.value });
+        spawnBurst(b.x,S.weaponY,14,S.factions[b.fid-1].base,5);
+        resetBall(b);                                  // 重置回1k并回顶
+      }
+    }
+  }
+}
+
+// ---------- 炮台：旋转 + 弹仓发射（含风暴加速旋转） ----------
+function startSalvo(f, shot){
+  let total=1, gap=FIRE_CD;
+  if(shot.weapon==="mg"){ total=Math.max(3,Math.min(40,Math.round(shot.value/MG_UNIT))); gap=MG_GAP; }
+  else if(shot.weapon==="storm"){ total=Math.max(3,Math.min(40,Math.round(shot.value/MG_UNIT))); gap=STORM_GAP; }
+  f.salvo={ weapon:shot.weapon, value:shot.value, total, fired:0, gap, t:0 };
+  f.lastWeapon=(WEAPONS.find(w=>w.key===shot.weapon)||{}).name||shot.weapon;
+}
+function fireOne(f){
+  const sv=f.salvo, per=sv.value/sv.total, wid=sv.weapon;
+  if(wid==="shield"){
+    f.shield=Math.min(SHIELD_CAP, f.shield+per);
+    const bx=BX+baseGX(f.id)*BS, by=BY+baseGY(f.id)*BS;
+    spawnBurst(bx,by,30,[142,255,200],5); addText(bx,by-18,"盾"+fmtVal(per),[142,255,200]);
+    return;
+  }
+  const spread = sv.total>1 ? (Math.random()-0.5)*0.12 : 0;
+  S.stats.fired++;
+  spawnForWeapon(wid, f.id, per, f.angle+spread);
+}
+function stepFiring(dt){
+  for(const f of S.factions){
+    if(!f.alive) continue;
+    const spin = (f.salvo && f.salvo.weapon==="storm") ? f.rot*3 : f.rot;
+    f.angle += spin*dt;
+    if(f.salvo){
+      f.salvo.t-=dt;
+      if(f.salvo.t<=0){
+        fireOne(f);
+        f.salvo.fired++;
+        if(f.salvo.fired>=f.salvo.total){ f.salvo=null; f.fireCD=FIRE_CD; }
+        else f.salvo.t=f.salvo.gap;
+      }
+    } else if(f.fireCD>0){
+      f.fireCD-=dt;
+    } else if(f.ammo.length>0){
+      startSalvo(f, f.ammo.shift());
+    } else {                                   // 无蓄能：怠速发射 1px 细弹，维持领土推进
+      f.idleT-=dt;
+      if(f.idleT<=0){ fireIdle(f); f.idleT=1/IDLE_RATE; }
+    }
+  }
+}
+
+// ---------- 子弹推进：连续铺路 + 仅染敌/空地消耗数值 ----------
+function paintTrailCell(p,cx,cy,rr,fac){
+  cx=Math.round(cx); cy=Math.round(cy); const R=Math.round(rr);
+  let claimed=0;
+  for(let dy=-R;dy<=R;dy++) for(let dx=-R;dx<=R;dx++){
+    if(dx*dx+dy*dy<=rr*rr){
+      const X=cx+dx, Y=cy+dy;
+      if(X>=0&&X<GW&&Y>=0&&Y<GH){
+        const idx=Y*GW+X;
+        if(S.cell[idx]!==fac.id){
+          if(S.cell[idx]!==0) S.factions[S.cell[idx]-1].area--;
+          S.cell[idx]=fac.id; S.factions[fac.id-1].area++;
+          setPixel(idx,fac); claimed++;
+        }
+      }
+    }
+  }
+  if(claimed>0){ p.value-=claimed*COST_CELL; if(p.value<=0) p.dead=true; }
+}
+function stepBullets(dt){
+  for(const p of S.bullets){ if(!p.dead){ p.px=p.x; p.py=p.y; } }
+  const sub=Math.max(1,Math.ceil(dt/(1/120))), sdt=dt/sub;
+  for(let s=0;s<sub;s++){
+    for(const p of S.bullets){
+      if(p.dead) continue;
+      p.x+=p.vx*sdt; p.y+=p.vy*sdt;
+      if(p.x<WALL){ p.x=WALL; p.vx=Math.abs(p.vx)*WALL_DAMP; p.bounces++; }
+      else if(p.x>GW-WALL){ p.x=GW-WALL; p.vx=-Math.abs(p.vx)*WALL_DAMP; p.bounces++; }
+      if(p.y<WALL){ p.y=WALL; p.vy=Math.abs(p.vy)*WALL_DAMP; p.bounces++; }
+      else if(p.y>GH-WALL){ p.y=GH-WALL; p.vy=-Math.abs(p.vy)*WALL_DAMP; p.bounces++; }
+    }
+  }
+  for(const p of S.bullets){
+    if(p.dead) continue;
+    const fac=S.factions[p.fid-1];
+    const dxs=p.x-p.px, dys=p.y-p.py, dlen=Math.hypot(dxs,dys);
+    const steps=Math.max(1,Math.ceil(dlen));
+    for(let st=1;st<=steps;st++){
+      const t=st/steps;
+      paintTrailCell(p, p.px+dxs*t, p.py+dys*t, p.trailR, fac);
+      if(p.dead) break;
+    }
+    p.px=p.x; p.py=p.y;
+    p.r=visualR(p.value, p.isBig);              // 随数值缩小
+    p.trailR=trailRadius(p.value, p.weapon);    // 横截面随数值变细
+    // 大球撞盾：积累动量而偏移
+    if(p.isBig){
+      for(const f of S.factions){
+        if(!f.alive||f.id===p.fid||f.shield<=0) continue;
+        const dx=p.x-baseGX(f.id), dy=p.y-baseGY(f.id), d=Math.hypot(dx,dy);
+        const sr=SHIELD_BR+Math.min(60,f.shield*SHIELD_R_PER);
+        if(d<sr && d>0.001){
+          const nx=dx/d, ny=dy/d, vn=p.vx*nx+p.vy*ny;
+          if(vn<0){ p.vx-=2*vn*nx; p.vy-=2*vn*ny; }
+          p.x=baseGX(f.id)+nx*sr; p.y=baseGY(f.id)+ny*sr;
+          p.vx*=1.06; p.vy*=1.06; f.shield=Math.max(0,f.shield-25);
+          addText(BX+p.x*BS,BY+p.y*BS-12,"盾挡",[142,255,200]);
+        }
+      }
+    }
+    for(const f of S.factions){
+      if(!f.alive||f.id===p.fid) continue;
+      if(p.weapon==="idle") continue;          // 怠速细弹不撞母球（只铺细线）
+      const ddx=p.x-baseGX(f.id), ddy=p.y-baseGY(f.id);
+      if(ddx*ddx+ddy*ddy<BASEHIT_R*BASEHIT_R){
+        let dmg=p.value*DAMAGE_K;
+        if(f.shield>0){ if(f.shield>=dmg){ f.shield-=dmg; dmg=0; } else { dmg-=f.shield; f.shield=0; } }
+        f.hp=Math.max(0,f.hp-dmg);
+        addText(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS-16,"-"+(p.value*DAMAGE_K).toFixed(0),f.base);
+        spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,14,f.base,6);
+        p.dead=true; break;
+      }
+    }
+    p.life-=dt; if(p.bounces>MAXB) p.life=0; if(p.life<=0) p.dead=true;
+  }
+  collideBullets();
+  if(S.bullets.some(b=>b.dead)) S.bullets=S.bullets.filter(b=>!b.dead);
+}
+
+// ---------- 敌弹互撞偏移（大球积累动量） ----------
+function collideBullets(){
+  const cs=50, buckets=new Map();
+  for(let i=0;i<S.bullets.length;i++){
+    const p=S.bullets[i]; const key=((p.x/cs)|0)+","+((p.y/cs)|0);
+    let arr=buckets.get(key); if(!arr){ arr=[]; buckets.set(key,arr); } arr.push(i);
+  }
+  const COLL=6;
+  for(let i=0;i<S.bullets.length;i++){
+    const a=S.bullets[i]; if(a.dead) continue;
+    const kx=(a.x/cs)|0, ky=(a.y/cs)|0;
+    for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+      const arr=buckets.get((kx+ox)+","+(ky+oy)); if(!arr) continue;
+      for(const j of arr){
+        if(j<=i) continue;
+        const b=S.bullets[j]; if(b.dead||a.fid===b.fid) continue;
+        if(a.weapon==="idle"||b.weapon==="idle") continue;   // 怠速弹不参与互撞，省开销
+        const dx=b.x-a.x, dy=b.y-a.y, d2=dx*dx+dy*dy;
+        if(d2>=COLL*COLL||d2<1e-6) continue;
+        const d=Math.sqrt(d2), nx=dx/d, ny=dy/d;
+        const vn=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+        if(vn<0){
+          const imp=-vn*0.8;
+          const ia=a.isBig?imp*BIG_MOMENTUM:imp, ib=b.isBig?imp*BIG_MOMENTUM:imp;
+          a.vx-=ia*nx; a.vy-=ia*ny; b.vx+=ib*nx; b.vy+=ib*ny;
+        }
+        const off=(Math.random()-0.5)*0.7;
+        a.vx+=-ny*off*SPEED; a.vy+=nx*off*SPEED;
+        b.vx+=ny*off*SPEED; b.vy+=-nx*off*SPEED;
+        clampSpeed(a); clampSpeed(b);
+        const push=(COLL-d)/2;
+        a.x-=nx*push; a.y-=ny*push; b.x+=nx*push; b.y+=ny*push;
+      }
+    }
+  }
+}
+function clampSpeed(p){
+  const sp=Math.hypot(p.vx,p.vy), lo=SPEED*0.6, hi=SPEED*1.4;
+  if(sp<lo){ const k=lo/(sp||1); p.vx*=k; p.vy*=k; }
+  else if(sp>hi){ const k=hi/sp; p.vx*=k; p.vy*=k; }
+}
+
+// ---------- 粒子 / 回血 / 盾衰减 ----------
+function stepFx(dt){
+  for(const p of S.parts){
+    if(!p.active) continue;
+    p.life-=dt; if(p.life<=0){ p.active=false; continue; }
+    p.vy+=300*dt; p.x+=p.vx*dt; p.y+=p.vy*dt;
+  }
+  for(let i=S.texts.length-1;i>=0;i--){ const t=S.texts[i]; t.life-=dt; t.y-=30*dt; if(t.life<=0) S.texts.splice(i,1); }
+  for(const f of S.factions){
+    if(f.alive) f.hp=Math.min(HP_MAX, f.hp+120*dt);
+    if(f.shield>0) f.shield=Math.max(0, f.shield-SHIELD_DECAY*dt);
+  }
+}
+
+// ---------- 势力覆灭（领地继承） ----------
+function checkDeaths(){
+  let alive=0;
+  for(const f of S.factions){
+    if(!f.alive) continue;
+    if(f.hp<=0){
+      f.alive=false;
+      S.log={text:`${f.name} 势力覆灭，领土被吞并`, t:3};
+      let heir=null, maxA=-1;
+      for(const g of S.factions){ if(g.alive&&g.area>maxA){ maxA=g.area; heir=g; } }
+      spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,120,f.base,10);
+      for(let i=0;i<GW*GH;i++){
+        if(S.cell[i]!==f.id) continue;
+        const x=i%GW, y=(i/GW)|0; let border=false;
+        for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+          const nx=x+dx,ny=y+dy;
+          if(nx<0||nx>=GW||ny<0||ny>=GH){border=true;break;}
+          const nb=S.cell[ny*GW+nx];
+          if(nb!==f.id&&(heir?nb!==heir.id:true)){border=true;break;}
+        }
+        if(heir){ claimCell(i,heir); }
+        else { S.cell[i]=0; backBuf[i]=DARK; }
+      }
+      f.area=0;
+    } else alive++;
+  }
+  if(alive<=1){ const w=S.factions.find(f=>f.alive); if(w) S.log={text:`${w.name} 取得胜利！点击「重开」再来一局`, t:999}; }
+}
+
+function stepGame(dt){
+  if(S.paused) return;
+  stepPlinko(dt);
+  stepFiring(dt);
+  stepBullets(dt);
+  stepFx(dt);
+  checkDeaths();
+  S.time+=dt;
+  if(S.log.t>0) S.log.t-=dt;
+}
+
+/* ============================================================
+ *  渲染
+ * ============================================================ */
+function render(){
+  ctx.fillStyle="#05060a"; ctx.fillRect(0,0,W,H);
+  drawStars();
+
+  backCtx.putImageData(backImg,0,0);
+  ctx.drawImage(backCanvas, BX, BY, drawW, drawH);
+  ctx.strokeStyle="#23263a"; ctx.lineWidth=1; ctx.strokeRect(BX-1,BY-1,drawW+2,drawH+2);
+
+  for(const f of S.factions){
+    if(!f.alive) continue;
+    const bx=BX+baseGX(f.id)*BS, by=BY+baseGY(f.id)*BS;
+    const sz=58; ctx.drawImage(S.baseSprite[f.id-1],bx-sz/2,by-sz/2,sz,sz);
+    ctx.beginPath(); ctx.arc(bx,by,9,0,Math.PI*2); ctx.fillStyle=rgb(f.base); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle="rgba(255,255,255,.6)"; ctx.stroke();
+    if(f.shield>0){
+      const sr=SHIELD_BR+Math.min(60,f.shield*SHIELD_R_PER);
+      ctx.save(); ctx.setLineDash([6,6]);
+      ctx.strokeStyle=rgba(f.base,0.45+0.3*Math.sin(S.time*6)); ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(bx,by,sr,0,Math.PI*2); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle=rgba(f.base,0.85); ctx.font="bold 11px 'Microsoft YaHei'"; ctx.textAlign="center";
+      ctx.fillText("盾"+fmtVal(f.shield), bx, by-sr-6);
+      ctx.restore();
+    }
+    const L=20, mx=bx+Math.cos(f.angle)*L, my=by+Math.sin(f.angle)*L;
+    ctx.strokeStyle=rgba(f.base,0.95); ctx.lineWidth=5; ctx.lineCap="round";
+    ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(mx,my); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(mx,my,3,0,Math.PI*2); ctx.fill();
+  }
+
+  for(const p of S.bullets){
+    const dx=BX+p.x*BS, dy=BY+p.y*BS, sz=p.r*5;
+    ctx.drawImage(S.bulletSprite[p.fid-1], dx-sz/2, dy-sz/2, sz, sz);
+    if(p.isBig){ ctx.strokeStyle="rgba(255,255,255,.5)"; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.arc(dx,dy,sz/2,0,Math.PI*2); ctx.stroke(); }
+  }
+
+  renderPlinko();
+
+  for(const p of S.parts){
+    if(!p.active) continue;
+    const a=Math.max(0,p.life/p.max);
+    ctx.globalAlpha=a; ctx.fillStyle=rgb(p.c); ctx.fillRect(p.x-p.r,p.y-p.r,p.r*2,p.r*2);
+  }
+  ctx.globalAlpha=1;
+  for(const t of S.texts){
+    const a=Math.max(0,t.life/t.max);
+    ctx.globalAlpha=a; ctx.fillStyle=rgb(t.color);
+    ctx.font="bold 15px 'Segoe UI','Microsoft YaHei'"; ctx.textAlign="center"; ctx.fillText(t.str,t.x,t.y);
+  }
+  ctx.globalAlpha=1;
+  renderHUD();
+}
+
+function renderPlinko(){
+  ctx.save();
+  ctx.fillStyle="#0a0c14"; ctx.fillRect(0,HUD_H,SPLIT,H-HUD_H);
+  ctx.strokeStyle="#23263a"; ctx.beginPath(); ctx.moveTo(SPLIT,HUD_H); ctx.lineTo(SPLIT,H); ctx.stroke();
+  for(const peg of S.pegs){
+    ctx.beginPath(); ctx.arc(peg.x,peg.y,peg.r,0,Math.PI*2);
+    ctx.fillStyle="#1a1e30"; ctx.fill(); ctx.strokeStyle="#3a4060"; ctx.lineWidth=1; ctx.stroke();
+  }
+  const my=S.multY;
+  ctx.strokeStyle="#2a3050"; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(S.layerX0,my); ctx.lineTo(S.layerX0+S.colW*MULT_N,my); ctx.stroke();
+  for(let c=0;c<MULT_N;c++){
+    const cx=S.layerX0+S.colW*(c+0.5);
+    ctx.fillStyle=MULT[c]===1?"#5b6277":"#ffd76a"; ctx.textAlign="center"; ctx.font="bold 13px 'Segoe UI'";
+    ctx.fillText(MULT[c]===1?"—":("X"+MULT[c]), cx, my-8);
+    ctx.beginPath(); ctx.arc(S.layerX0+S.colW*c,my,3,0,Math.PI*2); ctx.fillStyle="#3a4060"; ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(S.layerX0+S.colW*MULT_N,my,3,0,Math.PI*2); ctx.fillStyle="#3a4060"; ctx.fill();
+  const wy=S.weaponY;
+  for(let c=0;c<WEAPONS.length;c++){
+    const x0=S.layerX0+S.slotW*c;
+    ctx.fillStyle="#141828"; ctx.fillRect(x0+2,wy-22,S.slotW-4,44);
+    ctx.strokeStyle="#2a2f48"; ctx.lineWidth=1; ctx.strokeRect(x0+2,wy-22,S.slotW-4,44);
+    ctx.fillStyle=rgb(WEAPON_COLORS[c]); ctx.textAlign="center"; ctx.font="bold 13px 'Microsoft YaHei'";
+    ctx.fillText(WEAPONS[c].name, x0+S.slotW/2, wy+2);
+  }
+  for(const b of S.balls){
+    const fac=S.factions[b.fid-1];
+    ctx.drawImage(S.bulletSprite[b.fid-1], b.x-b.r*2.4, b.y-b.r*2.4, b.r*4.8, b.r*4.8);
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fillStyle=rgb(fac.base); ctx.fill();
+    ctx.lineWidth=1.5; ctx.strokeStyle="rgba(255,255,255,.7)"; ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.font="bold 11px 'Segoe UI'"; ctx.textAlign="center"; ctx.fillText(fmtVal(b.value),b.x,b.y+4);
+  }
+  ctx.restore();
+}
+
+function renderHUD(){
+  ctx.fillStyle="#0c0e18"; ctx.fillRect(0,0,W,HUD_H);
+  ctx.strokeStyle="#23263a"; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,HUD_H); ctx.lineTo(W,HUD_H); ctx.stroke();
+  let x=16; ctx.textAlign="left"; const tot=totalArea();
+  for(const f of S.factions){
+    const pct=tot>0?(f.area/tot*100):0;
+    ctx.fillStyle=f.alive?rgb(f.base):"#3a3f52"; ctx.fillRect(x,16,12,12);
+    ctx.fillStyle="#c9d1e8"; ctx.font="13px 'Microsoft YaHei'";
+    const w=f.lastWeapon+(f.ammo.length?("×"+f.ammo.length):"")+(f.shield>0?(" 盾"+fmtVal(f.shield)):"");
+    ctx.fillText(`${f.name} ${pct.toFixed(1)}% HP:${Math.ceil(f.hp)} ${w}`, x+18, 27);
+    x+=260;
+  }
+  if(S.log.t>0){ ctx.globalAlpha=Math.min(1,S.log.t); ctx.fillStyle="#ffd76a";
+    ctx.textAlign="right"; ctx.font="bold 13px 'Microsoft YaHei'"; ctx.fillText(S.log.text,W-16,27); ctx.globalAlpha=1; }
+  ctx.fillStyle="#5b6277"; ctx.textAlign="right"; ctx.font="12px 'Segoe UI'";
+  ctx.fillText("T+"+S.time.toFixed(1)+"s · "+GW+"×"+GH+" 像素", W-16, 44);
+}
+function totalArea(){ let s=0; for(const f of S.factions) s+=f.area; return s; }
+function drawStars(){
+  ctx.fillStyle="#fff";
+  for(let i=0;i<140;i++){ const sx=(i*97)%W, sy=(i*131)%H;
+    ctx.globalAlpha=0.12+((i*7)%10)*0.03; ctx.fillRect(sx,sy,1.5,1.5); }
+  ctx.globalAlpha=1;
+}
+
+let last=0;
+function loop(ts){
+  if(!last) last=ts;
+  let dt=(ts-last)/1000; last=ts;
+  if(dt>1/20) dt=1/20; dt*=S.speed;
+  stepGame(dt); render();
+  requestAnimationFrame(loop);
+}
+document.getElementById("btnPause").addEventListener("click",function(){ S.paused=!S.paused; this.textContent=S.paused?"继续":"暂停"; });
+document.getElementById("btnSpeed").addEventListener("click",function(){ S.speed=S.speed===1?2:(S.speed===2?4:1); this.textContent="速度 "+S.speed+"x"; });
+document.getElementById("btnRestart").addEventListener("click",function(){ reset(); document.getElementById("btnPause").textContent="暂停"; });
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Workbuddy 工作区数据（私有，不入库）
+.workbuddy/
+
+# 临时调试脚本/截图
+tmp/
