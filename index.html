@@ -23,6 +23,7 @@
     <button class="btn" id="btnPause">暂停</button>
     <button class="btn" id="btnSpeed">速度 1x</button>
     <button class="btn" id="btnRestart">重开</button>
+    <button class="btn" id="btnQ">画质 高</button>
     <span class="hint">左：资源球穿缝隙翻倍 · 落武器槽蓄能　右：炮台旋转开火（子弹铺路=数值 · 反弹 · 互撞偏移 · 盾吸收）</span>
   </div>
 <script>
@@ -68,7 +69,8 @@ const WEAPONS = [
 const WEAPON_COLORS = [[255,155,176],[255,210,122],[122,208,255],[142,255,200],[199,155,255]];
 
 // ---------- 常量 ----------
-const HP_MAX   = 3200;
+const HP_MAX   = 1_000_000;         // 母球本体血量
+const HP_REGEN = 120;               // 每秒回血（相对 1M 可忽略）
 const VALUE0   = 1000;
 const R0       = 22;
 const WALL     = 3;
@@ -80,22 +82,28 @@ const SPEED_SN = 470;
 const SPEED_BG = 150;
 const SPEED_ST  = 280;
 const FIRE_CD  = 0.5;
-const DAMAGE_K = 0.05;
+// 损耗系数【仅大球使用】：大球撞盾→球与盾各损耗 value*0.2；撞本体→球与本体各损耗 value*0.5；球不消失、被弹开
+const BODY_DMG_K  = 0.5;
+const SHIELD_DMG_K= 0.2;
+// 其他武器无损耗系数：命中时按其"到达时剩余数值"全额结算（盾优先吸收，溢出部分打本体），子弹被消耗
 const COST_CELL= 1.0;               // 每染一格(敌/空)消耗的数值
 const MG_UNIT  = 200;               // 机枪每颗子弹对应的数值
 const MG_GAP   = 0.045, STORM_GAP = 0.03;
-const SHIELD_CAP   = 6000;
+const SHIELD_INIT  = 1_000_000;     // 每个势力初始护盾数值
+const SHIELD_CAP   = 2_000_000;
 const SHIELD_DECAY = 8;             // 盾每秒自然衰减
-const SHIELD_BR    = R0 + 26;       // 盾环基础半径
+const SHIELD_BR    = R0 + 34;       // 盾环基础半径（网格单位，绘制时乘 BS）
 const SHIELD_R_PER = 0.00005;       // 盾环随数值增大的半径
 const BIG_MOMENTUM = 1.9;           // 大球碰撞动量系数
-// 占领横截面：随子弹当前数值(大小)变化；密度系数 + 分武器上限让狙击比大球细很多
-const DENS = { sniper:0.45, mg:0.55, big:1.0, storm:0.55, idle:1 };
-const TRAIL_CAP = { sniper:9, mg:5, big:26, storm:6, idle:1 };
+const BIG_TRAIL_SCALE = 1.0;        // 大球轨迹宽度 / 贴图半径（1=完全贴合；调小可延长射程）
+// 占领横截面：随子弹当前数值(大小)变化；大球轨迹宽度=其贴图半径（与视觉一致）
+const DENS = { sniper:0.45, mg:0.55, big:1.6, storm:0.55, idle:1 };
+const TRAIL_CAP = { sniper:9, mg:5, big:40, storm:6, idle:1 };
 const BASE_INSET  = 64;             // 势力母球距角落的内缩量（不再贴角）
 const IDLE_RATE   = 1000;           // 怠速细弹发射频率（颗/秒）：左侧无武器时维持推进
 const IDLE_VAL    = 5;              // 每颗怠速弹可占领的格数（1px 细线）
 function trailRadius(value, weapon){
+  if(weapon==="big") return Math.max(2, Math.min(120, visualR(value,true)*BIG_TRAIL_SCALE));  // 大球轨迹≈贴图半径
   const cap = TRAIL_CAP[weapon] || 7;
   return Math.max(1, Math.min(cap, 0.07*Math.sqrt(value)*DENS[weapon]));
 }
@@ -116,11 +124,17 @@ function rgb(c){ return "rgb("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+")"; }
 function rgba(c,a){ return "rgba("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+","+a+")"; }
 function packColor(c, br){ const r=(c[0]*br)|0,g=(c[1]*br)|0,b=(c[2]*br)|0; return ((255<<24)|(b<<16)|(g<<8)|r)>>>0; }
 function fmtVal(v){ return v>=1000 ? (v/1000).toFixed(v>=10000?0:1)+"k" : ""+Math.round(v); }
-function visualR(value, isBig){ return Math.max(2, Math.min(isBig?30:18, (isBig?3:2) + Math.sqrt(value)*(isBig?0.22:0.12))); }
+function visualR(value, isBig){
+  // 大球：半径随数值在 ~100k(47)→1M(100)→2M(120) 间平滑分布，不同数值大小明显不同
+  if(isBig) return Math.max(22, Math.min(120, 22 + Math.sqrt(value)*0.078));
+  return Math.max(2, Math.min(20, 2 + Math.sqrt(value)*0.12));
+}
 
 // ---------- 离屏百万像素缓冲 ----------
 let backCanvas, backCtx, backImg, backBuf;
-const DARK = packColor([10,12,20], 1);
+let mips = [];                       // 多级降采样链：mips[0]=1/2 … mips[3]=1/16（平滑+泛光用）
+const TAU = Math.PI * 2;
+const DARK = (255 << 24) >>> 0;     // 纯黑不透明：便于加色/滤色合成，空白区透出星空
 function ensureBack(){
   if(!backCanvas){
     backCanvas = document.createElement("canvas");
@@ -128,6 +142,22 @@ function ensureBack(){
     backCtx = backCanvas.getContext("2d");
     backImg = backCtx.createImageData(GW, GH);
     backBuf = new Uint32Array(backImg.data.buffer);
+  }
+  if(mips.length === 0){
+    for(let i = 1; i <= 4; i++){
+      const w = Math.max(2, GW >> i), h = Math.max(2, GH >> i);
+      const c = document.createElement("canvas"); c.width = w; c.height = h;
+      const cx = c.getContext("2d"); cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high";
+      mips.push({ cv:c, ctx:cx, w, h });
+    }
+  }
+}
+function buildMips(){
+  let src = backCanvas;
+  for(const m of mips){
+    m.ctx.clearRect(0, 0, m.w, m.h);
+    m.ctx.drawImage(src, 0, 0, m.w, m.h);
+    src = m.cv;
   }
 }
 
@@ -138,7 +168,7 @@ function setPixel(idx, fac){
   const gx=idx%GW, gy=(idx/GW)|0;
   const dx=gx-baseGX(fac.id), dy=gy-baseGY(fac.id);
   const norm=Math.min(1, Math.sqrt(dx*dx+dy*dy)/(GW*0.6));
-  const br=0.92 - 0.30*norm;                 // 距母球越近越亮，整体均匀渐变
+  const br=0.82 - 0.20*norm;                 // 距母球越近越亮，整体均匀渐变（配合泛光合成）
   backBuf[idx]=packColor(fac.base, br);
 }
 function claimCell(idx, fac){
@@ -164,7 +194,7 @@ function reset(){
 
   const factions = FACTION_DEFS.map((d,i)=>({
     id:i+1, name:d.name, base:d.base.slice(),
-    hp:HP_MAX, area:0, alive:true, shield:0,
+    hp:HP_MAX, area:0, alive:true, shield:SHIELD_INIT, shieldFlash:0,
     angle:i*Math.PI/2, rot:ROT[i],
     fireCD:FIRE_CD*(0.5+Math.random()*0.5),
     salvo:null, ammo:[], lastWeapon:"—", idleT:0,
@@ -172,7 +202,7 @@ function reset(){
 
   const cell = new Uint16Array(GW*GH);
   S = { factions, cell, backBuf, balls:[], pegs:[], bullets:[], parts:[], texts:[],
-        time:0, speed:1, paused:false,
+        time:0, speed:1, paused:false, quality:2, autoQ:true, fps:60, lowT:0,
         log:{ text:"战斗开始", t:2.2 }, stats:{ fired:0 } };
 
   // 四角母球 + 初始领地（自由起始，不计入武器数值）
@@ -206,8 +236,11 @@ function reset(){
   for(let f=0;f<4;f++) S.balls.push(makeBall(f+1));
 
   for(let i=0;i<2000;i++) S.parts.push({active:false,x:0,y:0,vx:0,vy:0,life:0,max:1,r:2,c:[255,255,255]});
-  S.bulletSprite=factions.map(f=>makeGlow(f.base,10));
+  S.bulletSprite=factions.map(f=>makeGlow(f.base,10,0.6));   // 其他武器发光略调暗
   S.baseSprite  =factions.map(f=>makeGlow(f.base,40));
+  S.coneSprite  =factions.map(f=>makeCone(f.base));   // 狙击：锥形弹头（指向 +X）
+  S.orbSprite   =factions.map(f=>makeOrb(f.base));    // 大球：实心球体
+  S.orbGlow     =factions.map(f=>makeGlow(f.base,96,0.55)); // 大球：柔光晕（略发光）
 }
 
 function makeBall(fid){
@@ -224,13 +257,87 @@ function redropKeepValue(b){
   b.vx=(Math.random()-0.5)*40; b.vy=0; b.multDone=false; b.bestY=b.y; b.refY=b.y; b.stuck=0;
 }
 
-function makeGlow(color,R){
+function makeGlow(color,R,intensity=1){
   const c=document.createElement("canvas"); c.width=c.height=R*2;
   const g=c.getContext("2d");
   const grd=g.createRadialGradient(R,R,0,R,R,R);
-  grd.addColorStop(0,rgba(color,1)); grd.addColorStop(0.4,rgba(color,0.5)); grd.addColorStop(1,rgba(color,0));
+  grd.addColorStop(0,rgba(color,1*intensity)); grd.addColorStop(0.4,rgba(color,0.5*intensity)); grd.addColorStop(1,rgba(color,0));
   g.fillStyle=grd; g.beginPath(); g.arc(R,R,R,0,Math.PI*2); g.fill();
   return c;
+}
+// 狙击：锥形弹头（尖朝 +X，尾拖一段），便于旋转绘制
+function makeCone(color){
+  const w=96, h=48, c=document.createElement("canvas"); c.width=w; c.height=h;
+  const g=c.getContext("2d");
+  const grd=g.createLinearGradient(0,0,w,0);
+  grd.addColorStop(0,   rgba(color,0));
+  grd.addColorStop(0.35,rgba(color,0.25));
+  grd.addColorStop(0.8, rgba(color,0.75));
+  grd.addColorStop(1,   rgba(color,1));
+  g.fillStyle=grd;
+  g.beginPath(); g.moveTo(w-2,h/2); g.lineTo(2,h/2-13); g.lineTo(2,h/2+13); g.closePath(); g.fill();
+  // 亮芯
+  g.strokeStyle="rgba(255,255,255,.95)"; g.lineWidth=2.4; g.lineCap="round";
+  g.beginPath(); g.moveTo(w-3,h/2); g.lineTo(w*0.34,h/2); g.stroke();
+  // 弹头高光点
+  g.fillStyle="rgba(255,255,255,.95)";
+  g.beginPath(); g.arc(w-7,h/2,3.2,0,TAU); g.fill();
+  return c;
+}
+// 大球：亮色调实心圆盘（无 3D 渐变/暗边/高光）
+function makeOrb(color){
+  const R=64, c=document.createElement("canvas"); c.width=c.height=R*2;
+  const g=c.getContext("2d");
+  g.fillStyle=rgb(color); g.beginPath(); g.arc(R,R,R-2,0,TAU); g.fill();
+  const light=[Math.min(255,color[0]+85),Math.min(255,color[1]+85),Math.min(255,color[2]+85)];
+  g.lineWidth=4; g.strokeStyle=rgba(light,0.9); g.beginPath(); g.arc(R,R,R-3,0,TAU); g.stroke();
+  return c;
+}
+// 网格护盾：六边形网格 + 能量波纹 + 扫描弧 + 外圈辉光 + 受击涟漪
+function drawShieldGrid(bx,by,sr,f){
+  const col=f.base, t=S.time;
+  ctx.save();
+  ctx.beginPath(); ctx.arc(bx,by,sr,0,TAU); ctx.clip();
+  // 能量底
+  const g=ctx.createRadialGradient(bx,by,0,bx,by,sr);
+  g.addColorStop(0,rgba(col,0.04)); g.addColorStop(0.7,rgba(col,0.09)); g.addColorStop(1,rgba(col,0.20));
+  ctx.fillStyle=g; ctx.fillRect(bx-sr,by-sr,sr*2,sr*2);
+  // 六边形网格
+  const R=Math.max(6, sr/5.5), dx=R*1.5, dy=Math.sqrt(3)*R;
+  ctx.lineWidth=1; let k=0;
+  for(let x=-sr-dx; x<=sr+dx; x+=dx){
+    k++; const yo=(k&1)?0:dy/2;
+    for(let y=-sr-dy+yo; y<=sr+dy; y+=dy){
+      const hx=bx+x, hy=by+y, d=Math.hypot(hx-bx,hy-by)/sr;
+      if(d>1.12) continue;
+      const wave=0.5+0.5*Math.sin(d*5.5 - t*3.0 + x*0.05);
+      const al=(0.12+0.55*wave)*(1-0.3*d);
+      ctx.beginPath();
+      for(let i=0;i<6;i++){
+        const a=1.0472*i+0.5236, px=hx+R*Math.cos(a), py=hy+R*Math.sin(a);
+        i?ctx.lineTo(px,py):ctx.moveTo(px,py);
+      }
+      ctx.closePath();
+      ctx.fillStyle=rgba(col,al*0.20); ctx.fill();
+      ctx.strokeStyle=rgba(col,0.22+0.6*al); ctx.stroke();
+    }
+  }
+  // 扫描弧
+  const sa=t*1.4;
+  ctx.strokeStyle="rgba(255,255,255,.5)"; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(bx,by,sr*0.72,sa,sa+0.9); ctx.stroke();
+  ctx.restore();
+  // 外圈辉光
+  ctx.save();
+  ctx.shadowColor=rgba(col,0.95); ctx.shadowBlur=14;
+  ctx.strokeStyle=rgba(col,0.9); ctx.lineWidth=2.2;
+  ctx.beginPath(); ctx.arc(bx,by,sr,0,TAU); ctx.stroke(); ctx.stroke();
+  ctx.restore();
+  // 受击涟漪
+  if(f.shieldFlash>0){
+    ctx.strokeStyle=rgba([255,255,255],0.7*f.shieldFlash); ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(bx,by,sr*(0.5+0.6*(1-f.shieldFlash)),0,TAU); ctx.stroke();
+  }
 }
 
 // ---------- 粒子 / 飘字 ----------
@@ -415,9 +522,12 @@ function stepBullets(dt){
       if(p.dead) break;
     }
     p.px=p.x; p.py=p.y;
-    p.r=visualR(p.value, p.isBig);              // 随数值缩小
-    p.trailR=trailRadius(p.value, p.weapon);    // 横截面随数值变细
-    // 大球撞盾：积累动量而偏移
+    // 半径/轨迹平滑插值：从大到小柔和过渡（避免命中瞬间突变；目标随数值变化）
+    const _tgtR=visualR(p.value, p.isBig), _tgtT=trailRadius(p.value, p.weapon);
+    const _k=Math.min(1, dt*8);
+    p.r     += (_tgtR - p.r)*_k;
+    p.trailR+= (_tgtT - p.trailR)*_k;
+    // 大球撞盾：球与盾各损耗 value*0.2，球不消失、被弹开（仅大球有损耗系数）
     if(p.isBig){
       for(const f of S.factions){
         if(!f.alive||f.id===p.fid||f.shield<=0) continue;
@@ -427,8 +537,13 @@ function stepBullets(dt){
           const nx=dx/d, ny=dy/d, vn=p.vx*nx+p.vy*ny;
           if(vn<0){ p.vx-=2*vn*nx; p.vy-=2*vn*ny; }
           p.x=baseGX(f.id)+nx*sr; p.y=baseGY(f.id)+ny*sr;
-          p.vx*=1.06; p.vy*=1.06; f.shield=Math.max(0,f.shield-25);
-          addText(BX+p.x*BS,BY+p.y*BS-12,"盾挡",[142,255,200]);
+          p.vx*=1.06; p.vy*=1.06;
+          const loss=p.value*SHIELD_DMG_K;
+          f.shield=Math.max(0,f.shield-loss);
+          p.value=Math.max(1,p.value-loss);
+          // 半径/轨迹由逐帧平滑插值处理（见 stepBullets 顶部）
+          f.shieldFlash=1;
+          addText(BX+p.x*BS,BY+p.y*BS-12,"盾挡-"+(loss).toFixed(0),[142,255,200]);
         }
       }
     }
@@ -437,12 +552,33 @@ function stepBullets(dt){
       if(p.weapon==="idle") continue;          // 怠速细弹不撞母球（只铺细线）
       const ddx=p.x-baseGX(f.id), ddy=p.y-baseGY(f.id);
       if(ddx*ddx+ddy*ddy<BASEHIT_R*BASEHIT_R){
-        let dmg=p.value*DAMAGE_K;
-        if(f.shield>0){ if(f.shield>=dmg){ f.shield-=dmg; dmg=0; } else { dmg-=f.shield; f.shield=0; } }
-        f.hp=Math.max(0,f.hp-dmg);
-        addText(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS-16,"-"+(p.value*DAMAGE_K).toFixed(0),f.base);
-        spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,14,f.base,6);
-        p.dead=true; break;
+        if(p.isBig){
+          // 大球撞本体：球与本体各损耗 value*0.5，球不消失、被弹开（仅大球有损耗系数）
+          const loss=p.value*BODY_DMG_K;
+          f.hp=Math.max(0,f.hp-loss);
+          p.value=Math.max(1,p.value-loss);
+          // 半径/轨迹由逐帧平滑插值处理（见 stepBullets 顶部）
+          const d=Math.hypot(ddx,ddy)||1, nx=ddx/d, ny=ddy/d, vn=p.vx*nx+p.vy*ny;
+          if(vn<0){ p.vx-=2*vn*nx; p.vy-=2*vn*ny; }
+          p.x=baseGX(f.id)+nx*BASEHIT_R; p.y=baseGY(f.id)+ny*BASEHIT_R;
+          p.vx*=1.1; p.vy*=1.1;
+          addText(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS-16,"-"+(loss).toFixed(0),f.base);
+          spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,14,f.base,6);
+          // 不置 dead：大球持续存活
+        } else {
+          // 其他武器：无损耗系数，按剩余数值全额结算（盾优先吸收，溢出打本体），子弹被消耗
+          let dmg;
+          if(f.shield>0){
+            if(f.shield>=p.value){ f.shield-=p.value; dmg=0; }
+            else { dmg=p.value-f.shield; f.shield=0; }
+          } else {
+            dmg=p.value;
+          }
+          f.hp=Math.max(0,f.hp-dmg);
+          addText(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS-16,"-"+(dmg).toFixed(0),f.base);
+          spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,14,f.base,6);
+          p.dead=true; break;
+        }
       }
     }
     p.life-=dt; if(p.bounces>MAXB) p.life=0; if(p.life<=0) p.dead=true;
@@ -502,8 +638,10 @@ function stepFx(dt){
   }
   for(let i=S.texts.length-1;i>=0;i--){ const t=S.texts[i]; t.life-=dt; t.y-=30*dt; if(t.life<=0) S.texts.splice(i,1); }
   for(const f of S.factions){
-    if(f.alive) f.hp=Math.min(HP_MAX, f.hp+120*dt);
+    if(!f.alive) continue;
+    f.hp=Math.min(HP_MAX, f.hp+HP_REGEN*dt);
     if(f.shield>0) f.shield=Math.max(0, f.shield-SHIELD_DECAY*dt);
+    if(f.shieldFlash>0) f.shieldFlash=Math.max(0, f.shieldFlash-1.8*dt);
   }
 }
 
@@ -514,22 +652,21 @@ function checkDeaths(){
     if(!f.alive) continue;
     if(f.hp<=0){
       f.alive=false;
-      S.log={text:`${f.name} 势力覆灭，领土被吞并`, t:3};
-      let heir=null, maxA=-1;
-      for(const g of S.factions){ if(g.alive&&g.area>maxA){ maxA=g.area; heir=g; } }
+      f.ammo.length=0; f.salvo=null;
+      // 左侧该势力资源球 → 在母球处以均匀角度发射为临死弹幕
+      const balls=S.balls.filter(b=>b.fid===f.id), n=balls.length;
+      balls.forEach((b,idx)=>{
+        const ang=(idx/n)*TAU + 0.15*Math.random();
+        spawnProj({ fid:f.id, weapon:"mg",
+          x:baseGX(f.id), y:baseGY(f.id), px:baseGX(f.id), py:baseGY(f.id),
+          vx:Math.cos(ang)*SPEED, vy:Math.sin(ang)*SPEED,
+          value:b.value, trailR:trailRadius(b.value,"mg"), life:6 });
+      });
+      S.balls=S.balls.filter(b=>b.fid!==f.id);     // 之后不再出现该色资源小球
+      S.log={text:`${f.name} 势力覆灭`, t:3};
       spawnBurst(BX+baseGX(f.id)*BS,BY+baseGY(f.id)*BS,120,f.base,10);
-      for(let i=0;i<GW*GH;i++){
-        if(S.cell[i]!==f.id) continue;
-        const x=i%GW, y=(i/GW)|0; let border=false;
-        for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
-          const nx=x+dx,ny=y+dy;
-          if(nx<0||nx>=GW||ny<0||ny>=GH){border=true;break;}
-          const nb=S.cell[ny*GW+nx];
-          if(nb!==f.id&&(heir?nb!==heir.id:true)){border=true;break;}
-        }
-        if(heir){ claimCell(i,heir); }
-        else { S.cell[i]=0; backBuf[i]=DARK; }
-      }
+      // 保留已占领区域颜色：仅将逻辑归属置空（cell=0），像素不动，面积清零
+      for(let i=0;i<GW*GH;i++){ if(S.cell[i]===f.id) S.cell[i]=0; }
       f.area=0;
     } else alive++;
   }
@@ -541,8 +678,8 @@ function stepGame(dt){
   stepPlinko(dt);
   stepFiring(dt);
   stepBullets(dt);
+  checkDeaths();          // 先判死：避免回血把本帧打空的 hp 又加回，导致母球永远打不死
   stepFx(dt);
-  checkDeaths();
   S.time+=dt;
   if(S.log.t>0) S.log.t-=dt;
 }
@@ -550,40 +687,81 @@ function stepGame(dt){
 /* ============================================================
  *  渲染
  * ============================================================ */
+// 占领区：纯黑背景 + 多级降采样 → 平滑边缘；加色铺底 + 滤色泛光 → 荧光观感
+function drawTerritory(){
+  const q=S.quality;                       // 2=高(平滑+泛光) 1=中(平滑) 0=低(原始)
+  ctx.fillStyle="#080a12"; ctx.fillRect(BX,BY,drawW,drawH);
+  if(q>=1){
+    ctx.globalCompositeOperation="lighter";
+    ctx.globalAlpha=0.55; ctx.drawImage(mips[0].cv, BX,BY,drawW,drawH);   // 1/2 平滑层
+    ctx.globalAlpha=0.50; ctx.drawImage(backCanvas , BX,BY,drawW,drawH);  // 原分辨率细节
+  } else {
+    ctx.globalCompositeOperation="lighter";
+    ctx.globalAlpha=1.0;  ctx.drawImage(backCanvas , BX,BY,drawW,drawH);   // 原始像素
+  }
+  if(q>=2){
+    ctx.globalCompositeOperation="screen";
+    ctx.globalAlpha=0.75; ctx.drawImage(mips[2].cv, BX,BY,drawW,drawH);   // 1/8 近场泛光
+    ctx.globalAlpha=0.55; ctx.drawImage(mips[3].cv, BX,BY,drawW,drawH);   // 1/16 远场泛光
+  }
+  ctx.globalAlpha=1; ctx.globalCompositeOperation="source-over";
+}
 function render(){
   ctx.fillStyle="#05060a"; ctx.fillRect(0,0,W,H);
   drawStars();
 
   backCtx.putImageData(backImg,0,0);
-  ctx.drawImage(backCanvas, BX, BY, drawW, drawH);
+  buildMips();
+  drawTerritory();
   ctx.strokeStyle="#23263a"; ctx.lineWidth=1; ctx.strokeRect(BX-1,BY-1,drawW+2,drawH+2);
 
   for(const f of S.factions){
     if(!f.alive) continue;
     const bx=BX+baseGX(f.id)*BS, by=BY+baseGY(f.id)*BS;
     const sz=58; ctx.drawImage(S.baseSprite[f.id-1],bx-sz/2,by-sz/2,sz,sz);
-    ctx.beginPath(); ctx.arc(bx,by,9,0,Math.PI*2); ctx.fillStyle=rgb(f.base); ctx.fill();
+    ctx.beginPath(); ctx.arc(bx,by,9,0,TAU); ctx.fillStyle=rgb(f.base); ctx.fill();
     ctx.lineWidth=2; ctx.strokeStyle="rgba(255,255,255,.6)"; ctx.stroke();
     if(f.shield>0){
-      const sr=SHIELD_BR+Math.min(60,f.shield*SHIELD_R_PER);
-      ctx.save(); ctx.setLineDash([6,6]);
-      ctx.strokeStyle=rgba(f.base,0.45+0.3*Math.sin(S.time*6)); ctx.lineWidth=3;
-      ctx.beginPath(); ctx.arc(bx,by,sr,0,Math.PI*2); ctx.stroke();
-      ctx.setLineDash([]); ctx.fillStyle=rgba(f.base,0.85); ctx.font="bold 11px 'Microsoft YaHei'"; ctx.textAlign="center";
-      ctx.fillText("盾"+fmtVal(f.shield), bx, by-sr-6);
-      ctx.restore();
+      const sr=(SHIELD_BR+Math.min(60,f.shield*SHIELD_R_PER))*BS;   // 网格护盾（碰撞半径与绘制一致）
+      drawShieldGrid(bx,by,sr,f);
+      ctx.fillStyle=rgba(f.base,0.9); ctx.font="bold 11px 'Microsoft YaHei'"; ctx.textAlign="center";
+      ctx.fillText("盾"+fmtVal(f.shield), bx, by-sr-8);
     }
     const L=20, mx=bx+Math.cos(f.angle)*L, my=by+Math.sin(f.angle)*L;
     ctx.strokeStyle=rgba(f.base,0.95); ctx.lineWidth=5; ctx.lineCap="round";
     ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(mx,my); ctx.stroke();
-    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(mx,my,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(mx,my,3,0,TAU); ctx.fill();
   }
 
   for(const p of S.bullets){
-    const dx=BX+p.x*BS, dy=BY+p.y*BS, sz=p.r*5;
-    ctx.drawImage(S.bulletSprite[p.fid-1], dx-sz/2, dy-sz/2, sz, sz);
-    if(p.isBig){ ctx.strokeStyle="rgba(255,255,255,.5)"; ctx.lineWidth=1.5;
-      ctx.beginPath(); ctx.arc(dx,dy,sz/2,0,Math.PI*2); ctx.stroke(); }
+    const dx=BX+p.x*BS, dy=BY+p.y*BS;
+    if(p.weapon==="sniper"){
+      const L=Math.max(13, Math.min(64, p.r*4.0)), wd=L*0.46, ang=Math.atan2(p.vy,p.vx);
+      ctx.save(); ctx.translate(dx,dy); ctx.rotate(ang);
+      ctx.globalCompositeOperation="lighter";
+      ctx.drawImage(S.coneSprite[p.fid-1], -L*0.5, -wd/2, L, wd);
+      ctx.restore(); ctx.globalCompositeOperation="source-over";
+    } else if(p.isBig){
+      const R=Math.max(4, p.r*BS);
+      // 柔光晕：随球大小缩放，叠加发光（不抢实心球体本身）
+      ctx.globalCompositeOperation="lighter";
+      ctx.globalAlpha=0.5;
+      const gs=R*3.2;
+      ctx.drawImage(S.orbGlow[p.fid-1], dx-gs/2, dy-gs/2, gs, gs);
+      ctx.globalAlpha=1;
+      ctx.globalCompositeOperation="source-over";
+      ctx.drawImage(S.orbSprite[p.fid-1], dx-R, dy-R, R*2, R*2);   // 实心球体
+    } else if(p.weapon==="idle"){
+      ctx.globalCompositeOperation="lighter";
+      ctx.fillStyle=rgba(S.factions[p.fid-1].base,0.9);
+      ctx.fillRect(dx-0.75,dy-0.75,1.5,1.5);
+      ctx.globalCompositeOperation="source-over";
+    } else {
+      const sz=p.r*5;
+      ctx.globalCompositeOperation="lighter";
+      ctx.drawImage(S.bulletSprite[p.fid-1], dx-sz/2, dy-sz/2, sz, sz);
+      ctx.globalCompositeOperation="source-over";
+    }
   }
 
   renderPlinko();
@@ -654,7 +832,7 @@ function renderHUD(){
   if(S.log.t>0){ ctx.globalAlpha=Math.min(1,S.log.t); ctx.fillStyle="#ffd76a";
     ctx.textAlign="right"; ctx.font="bold 13px 'Microsoft YaHei'"; ctx.fillText(S.log.text,W-16,27); ctx.globalAlpha=1; }
   ctx.fillStyle="#5b6277"; ctx.textAlign="right"; ctx.font="12px 'Segoe UI'";
-  ctx.fillText("T+"+S.time.toFixed(1)+"s · "+GW+"×"+GH+" 像素", W-16, 44);
+  ctx.fillText("T+"+S.time.toFixed(1)+"s · "+S.fps.toFixed(0)+"fps · 画质"+["低","中","高"][S.quality]+" · "+GW+"×"+GH+" 像素", W-16, 44);
 }
 function totalArea(){ let s=0; for(const f of S.factions) s+=f.area; return s; }
 function drawStars(){
@@ -667,14 +845,24 @@ function drawStars(){
 let last=0;
 function loop(ts){
   if(!last) last=ts;
-  let dt=(ts-last)/1000; last=ts;
-  if(dt>1/20) dt=1/20; dt*=S.speed;
+  let realDt=(ts-last)/1000; last=ts;
+  if(realDt>0.25) realDt=0.25;                       // 切后台回来不要爆冲
+  S.fps = S.fps ? S.fps*0.92 + (1/realDt)*0.08 : 60;
+  let dt=realDt; if(dt>1/20) dt=1/20; dt*=S.speed;
   stepGame(dt); render();
+  if(S.autoQ && S.fps<32) S.lowT+=realDt; else S.lowT=Math.max(0,S.lowT-realDt*2);
+  if(S.autoQ && S.lowT>4 && S.quality>0){
+    S.quality--; S.lowT=0;
+    btnQ.textContent="画质 "+["低","中","高"][S.quality];
+    S.log={text:"性能不足，画质自动降至"+["低","中","高"][S.quality], t:2.5};
+  }
   requestAnimationFrame(loop);
 }
+const btnQ = document.getElementById("btnQ");
 document.getElementById("btnPause").addEventListener("click",function(){ S.paused=!S.paused; this.textContent=S.paused?"继续":"暂停"; });
 document.getElementById("btnSpeed").addEventListener("click",function(){ S.speed=S.speed===1?2:(S.speed===2?4:1); this.textContent="速度 "+S.speed+"x"; });
 document.getElementById("btnRestart").addEventListener("click",function(){ reset(); document.getElementById("btnPause").textContent="暂停"; });
+btnQ.addEventListener("click",function(){ S.quality=(S.quality+1)%3; this.textContent="画质 "+["低","中","高"][S.quality]; S.autoQ=false; S.lowT=0; });
 
 reset();
 requestAnimationFrame(loop);
