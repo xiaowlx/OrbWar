@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <AssemblyName>OrbWar</AssemblyName>
+    <RootNamespace>OrbWar.Exe</RootNamespace>
+
+    <!-- 单文件、自包含、离线运行：打包 .NET 运行时，不依赖本机安装 -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>OrbWar</Product>
+    <Company>WorkBuddy</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <!-- 把游戏页面作为内嵌资源打入 exe（构建前由脚本复制最新 index.html -> game.html） -->
+  <ItemGroup>
+    <EmbeddedResource Include="game.html" LogicalName="OrbWar.Exe.game.html" />
+  </ItemGroup>
+
+</Project>

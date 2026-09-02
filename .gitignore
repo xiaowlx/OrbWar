@@ -3,3 +3,10 @@
 
 # 临时调试脚本/截图
 tmp/
+
+# OrbWar.Exe 构建产物（由 build_exe*.bat 生成，不入库；game.html 是 index.html 的副本）
+OrbWar.Exe/bin/
+OrbWar.Exe/obj/
+OrbWar.Exe/publish/
+OrbWar.Exe/publish_fd/
+OrbWar.Exe/game.html
