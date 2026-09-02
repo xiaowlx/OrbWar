@@ -6,8 +6,20 @@
 
 ## 运行
 
-- 本地：双击 `index.html`，任意现代浏览器打开即可，零依赖。
-- 网页：推送到 GitHub 后开启 Pages，根目录即游戏入口。
+- 网页版：双击 `index.html`，任意现代浏览器打开即可，零依赖。
+- 网页托管：推送到 GitHub 后开启 Pages，根目录即游戏入口。
+- 桌面版（Windows）：见下方「桌面版」一节，下载离线 exe，双击即玩。
+
+## 桌面版（Windows）
+
+`OrbWar.Exe` 是 .NET 9 + WebView2 外壳，把游戏内嵌为单机 exe，离线运行、不依赖浏览器。两种分发形态（见 [v1.0.2 Release](https://github.com/xiaowlx/OrbWar/releases/tag/1.0.2)）：
+
+| 版本 | 文件 | 说明 |
+| --- | --- | --- |
+| 自包含 | `OrbWar-1.0.2-win-x64-self-contained.zip` | 打包 .NET 运行时，本机无需安装任何环境 |
+| 依赖运行时 | `OrbWar-1.0.2-win-x64-framework.zip` | 体积小，需本机已装 .NET 9 运行时（WebView2 由 Win11 预装） |
+
+解压后运行 `OrbWar.exe` 即可。源码见仓库 `OrbWar.Exe/`（`OrbWar.Exe.csproj` / `Program.cs` / `build_exe.bat` / `build_exe_fd.bat`），`build_exe.bat` 一键重新构建自包含版。
 
 ## 玩法（全程自动，无需操作）
 
