@@ -12,12 +12,12 @@
 
 ## 桌面版（Windows）
 
-`OrbWar.Exe` 是 .NET 9 + WebView2 外壳，把游戏内嵌为单机 exe，离线运行、不依赖浏览器。两种分发形态（见 [v1.0.2 Release](https://github.com/xiaowlx/OrbWar/releases/tag/1.0.2)）：
+`OrbWar.Exe` 是 .NET 9 + WebView2 外壳，把游戏内嵌为单机 exe，离线运行、不依赖浏览器。两种分发形态（见 [v1.0.3 Release](https://github.com/xiaowlx/OrbWar/releases/tag/1.0.3)）：
 
 | 版本 | 文件 | 说明 |
 | --- | --- | --- |
-| 自包含 | `OrbWar-1.0.2-win-x64-self-contained.zip` | 打包 .NET 运行时，本机无需安装任何环境 |
-| 依赖运行时 | `OrbWar-1.0.2-win-x64-framework.zip` | 体积小，需本机已装 .NET 9 运行时（WebView2 由 Win11 预装） |
+| 自包含 | `OrbWar-1.0.3-win-x64-self-contained.zip` | 打包 .NET 运行时，本机无需安装任何环境 |
+| 依赖运行时 | `OrbWar-1.0.3-win-x64-framework.zip` | 体积小，需本机已装 .NET 9 运行时（WebView2 由 Win11 预装） |
 
 解压后运行 `OrbWar.exe` 即可。源码见仓库 `OrbWar.Exe/`（`OrbWar.Exe.csproj` / `Program.cs` / `build_exe.bat` / `build_exe_fd.bat`），`build_exe.bat` 一键重新构建自包含版。
 

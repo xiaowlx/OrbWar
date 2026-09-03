@@ -14,33 +14,19 @@
   #bar { width:100%; max-width:1366px; flex:0 0 auto; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .btn { background:var(--panel); border:1px solid var(--line); color:var(--txt); padding:8px 16px; border-radius:8px; cursor:pointer; font-size:14px; user-select:none; }
   .btn:hover { border-color:#3a4060; background:#171a2a; }
-  .btn.big { font-size:18px; padding:12px 36px; }
+  .btn.armed { border-color:#ffd76a; color:#ffd76a; }
   .hint { color:var(--dim); font-size:12px; margin-left:auto; }
-  #startOverlay { position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center; background:rgba(7,8,13,0.25); }
-  #startOverlay.hidden { display:none; }
-  .startCard { text-align:center; padding:34px 44px; border:1px solid var(--line); border-radius:16px; background:var(--panel); box-shadow:0 20px 60px rgba(0,0,0,.6); max-width:90vw; }
-  .startCard h1 { font-size:26px; margin-bottom:10px; }
-  .startCard p { color:var(--dim); font-size:14px; margin-bottom:18px; }
-  .startHint { margin-top:18px; margin-bottom:0; font-size:12px; }
 </style>
 </head>
 <body>
   <div id="stage"><canvas id="cv" width="1366" height="760"></canvas></div>
   <div id="bar">
-    <button class="btn" id="btnPause">暂停</button>
+    <button class="btn" id="btnPause">开始</button>
     <button class="btn" id="btnSpeed">速度 1x</button>
     <button class="btn" id="btnRestart">重开</button>
     <button class="btn" id="btnQ">画质 高</button>
-    <button class="btn" id="btnRec">录像</button>
-    <span class="hint">左：资源球穿缝隙翻倍 · 落武器槽蓄能　右：炮台旋转开火（子弹铺路=数值 · 反弹 · 互撞偏移 · 盾吸收）</span>
-  </div>
-  <div id="startOverlay">
-    <div class="startCard">
-      <h1>OrbWar — 球球领土战争</h1>
-      <p>四势力领土争夺 · 子弹铺路即占领</p>
-      <button class="btn big" id="btnStart">开始游戏</button>
-      <p class="startHint">左：资源球穿缝隙翻倍下移　右：炮台旋转开火（子弹铺路=数值 · 反弹 · 互撞偏移 · 盾吸收）</p>
-    </div>
+    <button class="btn" id="btnRec">录像本局</button>
+    <span class="hint">点「开始」开战（此前可先点「录像本局」录制整局）；战斗中按钮变为 暂停/继续 · 重开</span>
   </div>
 <script>
 "use strict";
@@ -82,7 +68,10 @@ const WEAPONS = [
   { key:"shield", name:"盾"   },
   { key:"storm",  name:"风暴" },
 ];
-const WEAPON_COLORS = [[255,155,176],[255,210,122],[122,208,255],[142,255,200],[199,155,255]];
+const WCOL = { mg:[255,210,122], storm:[199,155,255], sniper:[255,155,176], shield:[142,255,200], big:[122,208,255] };
+const wname = k => (WEAPONS.find(w=>w.key===k)||{}).name||k;
+// 底部武器槽（左→右）对称排列：机枪 风暴 狙击 盾 大球 盾 狙击 风暴 机枪
+const SLOTS = ["mg","storm","sniper","shield","big","shield","sniper","storm","mg"];
 
 // ---------- 常量 ----------
 const HP_MAX   = 1_000_000;         // 母球本体血量
@@ -116,9 +105,9 @@ const BIG_TRAIL_SCALE = 1.0;        // 大球轨迹宽度 / 贴图半径（1=完
 // 占领横截面：随子弹当前数值(大小)变化；大球轨迹宽度=其贴图半径（与视觉一致）
 const DENS = { sniper:0.45, mg:0.55, big:1.6, storm:0.55, idle:1 };
 const TRAIL_CAP = { sniper:9, mg:5, big:40, storm:6, idle:1 };
-const BASE_INSET  = 64;             // 势力母球距角落的内缩量（不再贴角）
+const BASE_INSET  = 150;             // 势力母球距角落的内缩量（调大=四势力向中间靠拢）
 const IDLE_RATE   = 10;             // 怠速弹发射频率（颗/秒）：左侧无武器时维持推进（可见脉冲流）
-const IDLE_VAL    = 300;             // 怠速弹数值：可涂格数更高 → 前沿推进更有力
+const IDLE_VAL    = 420;             // 怠速弹数值：可涂格数更高 → 前沿推进更有力
 // 子弹视觉/碰撞/涂抹半径统一入口：
 //  大球 = 数值定大小；狙击 = 数值定锥长；机枪/风暴/怠速 = 固定小尺寸（数值多就多发/延长弹幕，不放大单颗）
 function pxR(value, weapon, isBig){
@@ -128,7 +117,7 @@ function pxR(value, weapon, isBig){
 }
 function trailRadius(value, weapon){
   if(weapon==="big")   return Math.max(2, Math.min(120, visualR(value,true)*BIG_TRAIL_SCALE)); // 大球轨迹≈贴图半径
-  if(weapon==="sniper")return Math.max(1, visualR(value,false)*0.45);  // 狙击=锥形半宽（与轮廓一致）
+  if(weapon==="sniper")return Math.max(1.2, visualR(value,false)*0.55);  // 狙击锥半宽（占坑宽度=锥形轮廓）
   return Math.max(1, pxR(value, weapon, false));   // 普通/怠速：涂抹=视觉=碰撞（固定小尺寸）
 }
 const BULLET_CAP   = 8000;          // 上限调高：满员时优先挤掉怠速弹，不吞在飞子弹/大球
@@ -147,7 +136,14 @@ function baseGY(fid){ return (fid===1||fid===2) ? BASE_INSET : GH-BASE_INSET; }
 function rgb(c){ return "rgb("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+")"; }
 function rgba(c,a){ return "rgba("+(c[0]|0)+","+(c[1]|0)+","+(c[2]|0)+","+a+")"; }
 function packColor(c, br){ const r=(c[0]*br)|0,g=(c[1]*br)|0,b=(c[2]*br)|0; return ((255<<24)|(b<<16)|(g<<8)|r)>>>0; }
-function fmtVal(v){ return v>=1000 ? (v/1000).toFixed(v>=10000?0:1)+"k" : ""+Math.round(v); }
+function fmtVal(v){
+  if(v>=1_000_000) return (v/1_000_000).toFixed(v>=10_000_000?0:1).replace(/\.0$/,"")+"M";   // ≥1M 用兆
+  if(v>=1000){
+    const s=(v/1000).toFixed(v>=10000?0:1).replace(/\.0$/,"");
+    return (s==="1000"?"1M":s+"k");     // 999.5k+ 进位成 1M
+  }
+  return ""+Math.round(v);
+}
 function visualR(value, isBig){
   // 大球：半径随数值在 ~100k(47)→1M(100)→2M(120) 间平滑分布，不同数值大小明显不同
   if(isBig) return Math.max(22, Math.min(120, 22 + Math.sqrt(value)*0.078));   // 大球最小 22px，不再缩到 1px
@@ -262,16 +258,16 @@ function reset(){
   const panelL=16, panelR=SPLIT-16, panelW=panelR-panelL;
   S.layerX0=panelL; S.colW=panelW/MULT_N; S.panelL=panelL; S.panelR=panelR;
   S.multY=HUD_H+249;                       // 倍数层再下移两格(2×42px)
-  S.slotW=panelW/WEAPONS.length;
+  S.slotW=panelW/SLOTS.length;
   S.weaponY=H-130;
 
-  // 其余阻拦杆（随机掉落）；左右最外侧各一根贴边杆，防止小球卡在杆与边缘之间
+  // 其余阻拦杆（随机掉落）；最外侧的列如果贴墙太近(≈12~20px)不合理，予以剔除：只保留距左右边缘 ≥34px 的列
   const pegs=[]; let ri=0;
   for(let y=HUD_H+70; y<S.weaponY-24; y+=42){
     pegs.push({x:panelL, y, r:4});          // 最左贴边杆
     pegs.push({x:panelR, y, r:4});          // 最右贴边杆
     const off=(ri++%2)?20:0;
-    for(let x=panelL+off; x<panelR; x+=40) if(x>panelL+6 && x<panelR-6) pegs.push({x,y,r:4});
+    for(let x=panelL+off; x<panelR; x+=40) if(x>panelL+34 && x<panelR-34) pegs.push({x,y,r:4});
   }
   S.pegs=pegs;
 
@@ -473,8 +469,8 @@ function stepPlinko(dt){
           b.multDone=true;                             // 空列：本趟不再触发
         }
       } else if(b.y>=S.weaponY){
-        const col=Math.max(0,Math.min(WEAPONS.length-1,Math.floor((b.x-S.layerX0)/S.slotW)));
-        S.factions[b.fid-1].ammo.push({ weapon:WEAPONS[col].key, value:b.value });
+        const col=Math.max(0,Math.min(SLOTS.length-1,Math.floor((b.x-S.layerX0)/S.slotW)));
+        S.factions[b.fid-1].ammo.push({ weapon:SLOTS[col], value:b.value });
         spawnBurst(b.x,S.weaponY,14,S.factions[b.fid-1].base,5);
         resetBall(b);                                  // 重置回1k并回顶
       }
@@ -547,7 +543,31 @@ function paintTrailCell(p,cx,cy,rr,fac){
   }
   if(claimed>0){ p.value-=claimed*COST_CELL; if(p.value<=0) p.dead=true; }
 }
-// 墙壁反弹（普通子弹/大球）：碰撞体积=视觉半径（球缘触墙即钳制）。狙击不走这里——走"以边框为镜面"的镜像反弹
+// 狙击＝独立锥形子弹：按"锥形栅格"铺地（前尖后宽），占领路径与锥形轮廓一致，不再是圆点拖尾
+function paintSniper(p, fac){
+  const spd=Math.hypot(p.vx,p.vy)||1, nx=p.vx/spd, ny=p.vy/spd;
+  const hn=2*p.r;                 // 锥尖前伸半长(grid)=2×半径
+  const wb=0.55*p.r;              // 锥尾半宽(grid)=0.55×半径（与视觉锥一致）
+  const R=Math.ceil(hn+wb);
+  const cxi=Math.round(p.x), cyi=Math.round(p.y), hn2=hn*2;
+  let claimed=0;
+  for(let dy=-R;dy<=R;dy++) for(let dx=-R;dx<=R;dx++){
+    const X=cxi+dx, Y=cyi+dy;
+    if(X<0||X>=GW||Y<0||Y>=GH) continue;
+    const u=dx*nx+dy*ny;                 // 沿弹道方向
+    if(u<-hn||u>hn) continue;
+    const v=Math.abs(dx*ny-dy*nx);
+    if(v<=wb*(hn-u)/hn2){                // 尖在前、宽在后
+      const idx=Y*GW+X;
+      if(S.cell[idx]!==fac.id){
+        if(S.cell[idx]!==0) S.factions[S.cell[idx]-1].area--;
+        S.cell[idx]=fac.id; S.factions[fac.id-1].area++;
+        refreshAreaPix(idx); claimed++;
+      }
+    }
+  }
+  if(claimed>0){ p.value-=claimed; if(p.value<=0) p.dead=true; }
+}
 function hitWall(p, nx, ny){
   const vn=p.vx*nx+p.vy*ny;
   if(vn>=0) return;                                    // 正在离开墙面
@@ -563,7 +583,8 @@ function stepBullets(dt){
       if(p.dead) continue;
       p.x+=p.vx*sdt; p.y+=p.vy*sdt;
       if(p.weapon==="sniper"){
-        // 以边框为镜面：越过边框线的瞬间把位置+速度一起镜像 → 平滑镜面反弹（不整体转身）
+        // 不阻止、不提前转：让弹头钻出边框（越界部分由竞技场裁剪隐藏），
+        // 中心越过边框线的瞬间整体镜像 → 视觉=“从边框外射入一个一模一样的子弹”，在边框处平滑反弹
         if(p.x<0){ p.x=-p.x; p.vx=-p.vx; p.bounces++; }
         else if(p.x>GW){ p.x=2*GW-p.x; p.vx=-p.vx; p.bounces++; }
         if(p.y<0){ p.y=-p.y; p.vy=-p.vy; p.bounces++; }
@@ -579,25 +600,21 @@ function stepBullets(dt){
   for(const p of S.bullets){
     if(p.dead) continue;
     const fac=S.factions[p.fid-1];
+    if(p.homing){                                    // 回收飞行中：不铺路，抵达盾牌即入账
+      const hx=baseGX(p.fid)-p.x, hy=baseGY(p.fid)-p.y;
+      if(Math.hypot(hx,hy)<=p.r+6){ finishRecycle(p); continue; }
+    }
     const dxs=p.x-p.px, dys=p.y-p.py, dlen=Math.hypot(dxs,dys);
     const steps=Math.max(1,Math.ceil(dlen));
-    const cone = p.weapon==="sniper";
-    for(let st=1;st<=steps;st++){
-      const t=st/steps;
-      const scx=p.px+dxs*t, scy=p.py+dys*t;
-      paintTrailCell(p, scx, scy, p.trailR, fac);
-      if(cone && !p.dead){
-        // 涂抹痕迹=锥形轮廓：从弹头向尾部半径线性收敛到 0
-        const inv=dlen||1, ux=-dxs/inv, uy=-dys/inv;
-        const K=6, tgap=Math.max(1.5, p.trailR*0.9);
-        for(let kt=1;kt<=K;kt++){
-          const rr=p.trailR*(1-kt/(K+0.5));
-          if(rr<0.6) break;
-          paintTrailCell(p, scx+ux*tgap*kt, scy+uy*tgap*kt, rr, fac);
-          if(p.dead) break;
-        }
+    if(!p.homing && p.weapon==="sniper"){
+      // 狙击：整颗弹本身是锥形 → 占领路径按锥形栅格涂（前尖后宽）
+      paintSniper(p, fac);
+    } else {
+      for(let st=1; st<=steps && !p.homing; st++){
+        const t=st/steps;
+        paintTrailCell(p, p.px+dxs*t, p.py+dys*t, p.trailR, fac);
+        if(p.dead) break;
       }
-      if(p.dead) break;
     }
     p.px=p.x; p.py=p.y;
     // 半径/轨迹平滑插值：从大到小柔和过渡（避免命中瞬间突变；目标随数值变化）
@@ -622,15 +639,30 @@ function stepBullets(dt){
           p.value=Math.max(0,p.value-loss); if(p.value<=0) p.dead=true;
           // 半径/轨迹由逐帧平滑插值处理（见 stepBullets 顶部）
           f.shieldFlash=1;
-          addText(BX+p.x*BS,BY+p.y*BS-12,"盾挡-"+(loss>99999?(loss/1000|0)+"k":Math.round(loss)),[142,255,200]);
+          addText(BX+p.x*BS,BY+p.y*BS-12,"盾挡-"+fmtVal(loss),[142,255,200]);
         }
       }
     }
     for(const f of S.factions){
+      if(p.homing) break;                      // 回收飞行中：不再与敌方结算，专心飞回本方盾牌
       if(!f.alive||f.id===p.fid) continue;
       if(p.weapon==="idle") continue;          // 怠速细弹不撞母球（只铺细线）
-      const ddx=p.x-baseGX(f.id), ddy=p.y-baseGY(f.id), reach=BASEHIT_R+p.r;
-      if(ddx*ddx+ddy*ddy<reach*reach){    // 碰撞体积=视觉半径：球缘触本体即判碰
+      const ddx=p.x-baseGX(f.id), ddy=p.y-baseGY(f.id), dist2=ddx*ddx+ddy*ddy, dist=Math.sqrt(dist2);
+      const srR=SHIELD_BR+Math.min(60,f.shield*SHIELD_R_PER);
+      // 普通子弹：球缘触到盾环即被盾优先吸收，溢出打本体 —— 修"子弹穿盾"（原只在本体半径才结算）
+      if(!p.isBig && f.shield>0 && dist<srR+p.r){
+        const absorbed=Math.min(p.value,f.shield);
+        let dmg=0;
+        if(f.shield>=p.value){ f.shield-=p.value; }
+        else { dmg=p.value-f.shield; f.shield=0; }
+        f.hp=Math.max(0,f.hp-dmg); f.shieldFlash=1;
+        // 完全吸收不弹"盾全吸收"字样：全部情况都只浮数字（满吸收显示盾吸收量，溢出显示 HP 伤害量）
+        addText(BX+p.x*BS,BY+p.y*BS-12, dmg>0?("-"+Math.round(dmg)):("-"+Math.round(absorbed)), dmg>0?f.base:[142,255,200]);
+        spawnBurst(BX+p.x*BS,BY+p.y*BS,10,f.base,5);
+        p.dead=true; break;
+      }
+      const reach=BASEHIT_R+p.r;
+      if(dist2<reach*reach){    // 碰撞体积=视觉半径：球缘触本体即判碰
         if(p.isBig){
           // 大球撞本体：球与本体各损耗 value*0.5，球不消失、被弹开（仅大球有损耗系数）
           const loss=p.value*BODY_DMG_K;
@@ -661,7 +693,7 @@ function stepBullets(dt){
       }
     }
     if(p.value<=0) p.dead=true;                                  // 只有数值归零才会消失（寿命/反弹均不杀子弹）
-    if(!p.dead && !p.isBig && p.bounces>RECYCLE_B) recycleToShield(p);   // 弹跳过多 → 回收成盾
+    if(!p.dead && !p.isBig && !p.homing && p.weapon!=="sniper" && p.bounces>RECYCLE_B) startRecycle(p);   // 弹跳过多→飞回本方化为护盾（狙击除外）
     if(p.isBig){                                                 // 大球速度封顶（含互撞/撞盾/撞本体后）：不会越撞越快
       const _sp=Math.hypot(p.vx,p.vy), _mx=SPEED_BG*1.25;
       if(_sp>_mx){ const _km=_mx/_sp; p.vx*=_km; p.vy*=_km; }
@@ -674,15 +706,23 @@ function stepBullets(dt){
   if(S.bullets.some(b=>b.dead)) S.bullets=S.bullets.filter(b=>!b.dead);
 }
 
-// ---------- 弹跳过多回收成盾（普通子弹不白消失） ----------
-function recycleToShield(p){
+// ---------- 弹跳过多回收成盾（带飞回动画：从所在位置回到本方盾牌处入账） ----------
+function startRecycle(p){
+  const tx=baseGX(p.fid), ty=baseGY(p.fid);
+  const dx=tx-p.x, dy=ty-p.y, dist=Math.hypot(dx,dy)||1;
+  const sp=Math.max(420, dist/0.55);              // 约 0.55 秒飞回本方母球
+  p.homing=true;
+  p.vx=dx/dist*sp; p.vy=dy/dist*sp;
+}
+function finishRecycle(p){
   const f=S.factions[p.fid-1];
   if(!f.alive){ p.dead=true; return; }
   const gain=Math.min(p.value, SHIELD_CAP-f.shield);
   if(gain>0) f.shield+=gain;
   const bx=BX+baseGX(f.id)*BS, by=BY+baseGY(f.id)*BS;
-  spawnBurst(bx,by,22,f.base,6);
-  addText(bx,by-12,"回收+"+(gain>99999?(gain/1000|0)+"k":Math.round(gain))+"盾",[142,255,200]);
+  spawnBurst(bx,by,26,f.base,6);
+  addText(bx,by-14,"回收+"+fmtVal(gain)+"盾",[142,255,200]);
+  f.shieldFlash=1;
   p.dead=true;
 }
 
@@ -702,6 +742,7 @@ function collideBullets(){
         if(j<=i) continue;
         const b=S.bullets[j]; if(b.dead||a.fid===b.fid) continue;
         if(a.weapon==="idle"||b.weapon==="idle") continue;   // 怠速弹不参与互撞，省开销
+        if(a.homing||b.homing) continue;                     // 回收飞行中的子弹不再互撞
         const dx=b.x-a.x, dy=b.y-a.y, d2=dx*dx+dy*dy;
         const combined=a.r+b.r;                 // 碰撞体积=视觉半径之和（各武器一致）
         if(d2>=combined*combined||d2<1e-6) continue;
@@ -727,7 +768,7 @@ function collideBullets(){
         b.value=Math.max(0, bBigVal - (bBigVal>=aBigVal ? lRef : Math.min(bBigVal, lRef)));
         if(a.value<=0) a.dead=true;
         if(b.value<=0) b.dead=true;
-        addText(BX+(a.x+b.x)*0.5*BS, BY+(a.y+b.y)*0.5*BS-12, "互撞-"+(lRef>99999?(lRef/1000|0)+"k":Math.round(lRef)), [255,190,120]);
+        addText(BX+(a.x+b.x)*0.5*BS, BY+(a.y+b.y)*0.5*BS-12, "互撞-"+fmtVal(lRef), [255,190,120]);
         // 弹性互推放在损耗之后：即使某一方被损耗完消失，存活方的轨迹也必须改变
         const vn=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
         if(vn<0){
@@ -820,9 +861,10 @@ function drawTerritory(){
     if(q>=2){
       ctx.globalAlpha=0.85; ctx.drawImage(mips[0].cv, BX,BY,drawW,drawH);   // 1/2 平滑主层
       ctx.globalAlpha=0.35; ctx.drawImage(mips[1].cv, BX,BY,drawW,drawH);   // 1/4 柔化过渡
-      // 不叠原分辨率细节层：边缘呈平滑曲线而非像素块
+      ctx.globalAlpha=0.22; ctx.drawImage(backCanvas, BX,BY,drawW,drawH);   // 薄叠原分辨率：新涂的细痕迹能盖住周围旧色
     } else {
       ctx.globalAlpha=0.90; ctx.drawImage(mips[0].cv, BX,BY,drawW,drawH);   // 中画质：仅 1/2 平滑
+      ctx.globalAlpha=0.30; ctx.drawImage(backCanvas, BX,BY,drawW,drawH);   // 薄叠原分辨率：新痕迹可覆盖旧色
     }
   } else {
     ctx.globalCompositeOperation="lighter";
@@ -867,8 +909,8 @@ function render(){
   for(const p of S.bullets){
     const dx=BX+p.x*BS, dy=BY+p.y*BS;
     if(p.weapon==="sniper"){
-      // 锥形加长：总长=3×碰撞半径，锥宽=总长×0.3（半宽≈0.45r = 涂抹半径，轨迹与轮廓一致）
-      const L=Math.max(9, 3*p.r*BS), wd=L*0.30, ang=Math.atan2(p.vy,p.vx);
+      // 独立锥形弹：总长=4×r、宽/长≈0.28（半宽0.55r）→ 与 paintSniper 栅格占坑完全一致
+      const L=Math.max(12, 4*p.r*BS), wd=L*0.28, ang=Math.atan2(p.vy,p.vx);
       ctx.save(); ctx.translate(dx,dy); ctx.rotate(ang);
       ctx.drawImage(S.coneSprite[p.fid-1], -L*0.5, -wd/2, L, wd);
       ctx.restore();
@@ -938,12 +980,13 @@ function renderPlinko(){
   }
   ctx.beginPath(); ctx.arc(S.layerX0+S.colW*MULT_N,my,3,0,Math.PI*2); ctx.fillStyle="#3a4060"; ctx.fill();
   const wy=S.weaponY;
-  for(let c=0;c<WEAPONS.length;c++){
+  for(let c=0;c<SLOTS.length;c++){
     const x0=S.layerX0+S.slotW*c;
-    ctx.fillStyle="#141828"; ctx.fillRect(x0+2,wy-22,S.slotW-4,44);
-    ctx.strokeStyle="#2a2f48"; ctx.lineWidth=1; ctx.strokeRect(x0+2,wy-22,S.slotW-4,44);
-    ctx.fillStyle=rgb(WEAPON_COLORS[c]); ctx.textAlign="center"; ctx.font="bold 13px 'Microsoft YaHei'";
-    ctx.fillText(WEAPONS[c].name, x0+S.slotW/2, wy+2);
+    ctx.fillStyle="#141828"; ctx.fillRect(x0+1,wy-22,S.slotW-2,44);
+    ctx.strokeStyle= c===4 ? "#3d6dff" : "#2a2f48"; ctx.lineWidth= c===4?1.5:1;   // 中间"大球"槽高亮
+    ctx.strokeRect(x0+1,wy-22,S.slotW-2,44);
+    ctx.fillStyle=rgb(WCOL[SLOTS[c]]); ctx.textAlign="center"; ctx.font="bold 12px 'Microsoft YaHei'";
+    ctx.fillText(wname(SLOTS[c]), x0+S.slotW/2, wy+2);
   }
   for(const b of S.balls){
     const fac=S.factions[b.fid-1];
@@ -1010,15 +1053,30 @@ function loop(ts){
   requestAnimationFrame(loop);
 }
 const btnQ = document.getElementById("btnQ");
-document.getElementById("btnPause").addEventListener("click",function(){ S.paused=!S.paused; this.textContent=S.paused?"继续":"暂停"; });
+const btnPause = document.getElementById("btnPause");
+function beginGame(){                        // 「开始」与「暂停」合并：首个按钮即开始
+  started=true;
+  btnPause.textContent="暂停";
+  if(recArmed){ recArmed=false; startRecording(); }
+}
+function restartGame(){                      // 重开：回到未开始状态，可重新选择是否录像
+  stopRecording();
+  reset();
+  started=false; S.paused=false;
+  btnPause.textContent="开始";
+  recArmed=false; recUI();
+}
+btnPause.addEventListener("click",function(){
+  if(!started){ beginGame(); return; }
+  S.paused=!S.paused; this.textContent=S.paused?"继续":"暂停";
+});
 document.getElementById("btnSpeed").addEventListener("click",function(){ S.speed=S.speed===1?2:(S.speed===2?4:1); this.textContent="速度 "+S.speed+"x"; });
-document.getElementById("btnRestart").addEventListener("click",function(){ reset(); document.getElementById("btnPause").textContent="暂停"; });
-document.getElementById("btnStart").addEventListener("click",function(){ started=true; document.getElementById("startOverlay").classList.add("hidden"); });
+document.getElementById("btnRestart").addEventListener("click",restartGame);
 btnQ.addEventListener("click",function(){ S.quality=(S.quality+1)%3; this.textContent="画质 "+["低","中","高"][S.quality]; S.autoQ=false; S.lowT=0; });
 
 // ---------- 整局录像：canvas 60fps 采集 → WebM，点击停止或分出胜负时自动保存 ----------
 const btnRec = document.getElementById("btnRec");
-let recorder=null, recChunks=[], recStartT=0;
+let recorder=null, recChunks=[], recStartT=0, recArmed=false;   // recArmed：开局前选中"本局录像"
 function pickRecMime(){
   if(typeof MediaRecorder==="undefined" || !cv.captureStream) return null;
   // VP8 编码比 VP9 快，优先保证录制流畅；仍带 webm 兜底
@@ -1027,10 +1085,11 @@ function pickRecMime(){
   }
   return null;
 }
-function recUI(rec){
-  btnRec.textContent=rec?"停止·保存":"录像";
-  btnRec.style.borderColor=rec?"#ff5a5a":"";
-  btnRec.style.color=rec?"#ff8a8a":"";
+function recUI(){
+  const recOn = recorder && recorder.state!=="inactive";
+  btnRec.textContent = recOn ? "录像中·结束自动存" : (recArmed ? "✓ 本局将录像" : "录像本局");
+  btnRec.style.borderColor = recOn ? "#ff5a5a" : (recArmed ? "#ffd76a" : "");
+  btnRec.style.color = recOn ? "#ff8a8a" : (recArmed ? "#ffd76a" : "");
 }
 function startRecording(){
   if(recorder || !cv.captureStream){ S.log={text:"当前环境不支持录像", t:2.5}; return; }
@@ -1045,16 +1104,16 @@ function startRecording(){
   recorder.onstop=saveRecording;
   recorder.start(100);                           // 每 100ms 收一段：长录制更稳、编码压力更均匀
   recStartT=performance.now();
-  recUI(true);
-  S.log={text:"录像中…（60fps），停止或分出胜负后自动保存", t:3};
+  recUI();
+  S.log={text:"录像中…（60fps），分出胜负后自动保存", t:3};
 }
 function stopRecording(){
   if(recorder && recorder.state!=="inactive"){
     recorder.stop();
-  } else recUI(false);
+  } else recUI();
 }
 function saveRecording(){
-  recUI(false);
+  recUI();
   const blob=new Blob(recChunks,{type:"video/webm"});
   const secs=Math.round((performance.now()-recStartT)/1000);
   const fn=`OrbWar_${String(secs/60|0).padStart(2,"0")}m${String(secs%60).padStart(2,"0")}s_${new Date().getTime()}.webm`;
@@ -1069,7 +1128,10 @@ function saveRecording(){
   }
   recorder=null;
 }
-btnRec.addEventListener("click",function(){ recorder&&recorder.state!=="inactive" ? stopRecording() : startRecording(); });
+btnRec.addEventListener("click",function(){
+  if(started){ S.log={text:"录像需在开局前决定（点「开始」前选择）", t:2.2}; return; }
+  recArmed=!recArmed; recUI();
+});
 
 reset();
 requestAnimationFrame(loop);
